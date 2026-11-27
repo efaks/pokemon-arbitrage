@@ -151,6 +151,15 @@ const PRICE_VARIATIONS_BPS = [-720, 560, -390, 250, -130, 130, -250, 390, -560, 
 const SHIPPING_CENTS = { sealed: 650, graded: 499, raw: 199 };
 const MILLISECONDS_PER_DAY = 86_400_000;
 
+/** Upsert the starter catalog for live market sync. */
+export function seedStarterSkus(db: ArbitrageDatabase, referenceNow = new Date()): { skusSeeded: number } {
+  const timestamp = referenceNow.toISOString();
+  for (const { fmvCents, ...sku } of CATALOG) {
+    db.upsertSku({ ...sku, createdAt: timestamp, updatedAt: timestamp });
+  }
+  return { skusSeeded: CATALOG.length };
+}
+
 function buildComp(
   entry: CatalogEntry,
   condition: CardCondition,

@@ -3,10 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": { "node": ">=22.18.0" },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test 'test/**/*.test.ts'",
     "demo": "node src/cli.ts demo",
+    "doctor": "node src/cli.ts doctor",
+    "bootstrap": "node src/cli.ts bootstrap",
     "scan": "node src/cli.ts scan",
     "sync": "node src/cli.ts sync",
     "serve": "node src/cli.ts serve",

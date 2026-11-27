@@ -331,7 +331,8 @@ export class ShopifyStorefrontConnector implements SupplyConnector {
             priceCents: cents, shippingCents: 0, currency: 'USD', quantity: 1,
             upc: variant.barcode || undefined,
             imageUrls: (product.images ?? []).flatMap(image => image.src ? [image.src] : []),
-            seller: seller(hostname), supportsAutoCheckout: false, fetchedAt: now,
+            seller: firstPartyRetailerSeller('shopify:' + hostname, hostname),
+            supportsAutoCheckout: false, fetchedAt: now,
             listedAt: Number.isFinite(createdAt) ? new Date(createdAt).toISOString() : now,
           });
         }

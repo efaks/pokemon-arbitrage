@@ -95,6 +95,8 @@ export interface SellerProfile {
   /** Positive feedback on a 0–100 scale. */
   positivePercent: number;
   accountAgeDays: number;
+  /** True when the source does not disclose the seller's account age. */
+  accountAgeUnknown?: boolean;
   returnsAccepted: boolean;
 }
 

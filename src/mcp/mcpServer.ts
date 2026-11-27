@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { seedCanonicalCatalog } from '../catalog/seed.ts';
+import { seedCanonicalCatalog, seedStarterSkus } from '../catalog/seed.ts';
 import type { SystemRuntime } from '../cli.ts';
 import { MockScenarioConnector } from '../connectors/mockScenarioConnector.ts';
 import {
@@ -8,6 +8,7 @@ import {
 } from '../domain/types.ts';
 import type { RawListing, SoldComp } from '../domain/types.ts';
 import { AutopilotEngine } from '../engine/autopilot.ts';
+import { evaluateReadiness } from '../engine/readiness.ts';
 import type { McpHttpHandler } from '../server/httpServer.ts';
 import {
   JSON_RPC_ERROR_CODES as codes, jsonRpcError, jsonRpcSuccess, mcpToolError, mcpToolSuccess,
@@ -174,7 +175,7 @@ const skuSchema = object({
 const sellerSchema = object({
   sellerId: nonBlank, username: nonBlank, feedbackScore: integer(0),
   positivePercent: { type: 'number', minimum: 0, maximum: 100 },
-  accountAgeDays: integer(0), returnsAccepted: boolean,
+  accountAgeDays: integer(0), accountAgeUnknown: boolean, returnsAccepted: boolean,
 }, 'sellerId', 'username', 'feedbackScore', 'positivePercent', 'accountAgeDays', 'returnsAccepted');
 
 const listingFields = {
@@ -191,6 +192,7 @@ const webhookFields = {
 const webhookListingSchema = object({ ...webhookFields, skipDeduplication: boolean }, 'title', 'priceCents');
 const httpWebhookSchema = object(webhookFields, 'title', 'priceCents');
 const priorityTier = choice({ HOT: 'hot', STANDARD: 'standard', COLD: 'cold' });
+const passTier = choice({ ALL: 'all', HOT: 'hot', STANDARD: 'standard', COLD: 'cold' });
 
 function webhookListing(fields: SchemaValue<typeof httpWebhookSchema>): RawListing {
   const now = new Date().toISOString();
@@ -264,6 +266,8 @@ function approvalGuidance(reason: string): string {
 
 function makeTools(runtime: SystemRuntime, autopilot: AutopilotEngine): Tool[] {
   const { db, config, inventoryManager, pipeline, fmvEngine } = runtime;
+  const syncMarketData = (limit?: number) =>
+    runtime.marketSync.syncAll({ limit, buyBook: autopilot.getBuyBook(), fmvEngine, config });
   return [
     tool('get_system_state', 'Read dashboard metrics, P&L, enabled connectors, and risk thresholds.', noArgs, readOnly,
       () => systemState(runtime)),
@@ -409,9 +413,23 @@ function makeTools(runtime: SystemRuntime, autopilot: AutopilotEngine): Tool[] {
       () => ({ ...autopilot.runRepricingCycle() })),
     tool('sync_market_data', 'Import catalog and price data from enabled providers and refresh the Buy Book.',
       object({ limit }), { ...localWrite, openWorldHint: true, destructiveHint: false },
-      async ({ limit }) => ({
-        ...await runtime.marketSync.syncAll({ limit, buyBook: autopilot.getBuyBook(), fmvEngine, config }),
-      })),
+      async ({ limit }) => ({ ...await syncMarketData(limit) })),
+    tool('check_readiness', 'Check catalog freshness, enabled providers, checkout capability, and setup blockers.',
+      noArgs, readOnly, () => ({ ...evaluateReadiness(runtime, { autopilot }) })),
+    tool('bootstrap_catalog', 'Upsert the 20 starter SKUs. Include fixture sales only in a separate demo database.',
+      object({ includeDemoComps: boolean }), localWrite, ({ includeDemoComps }) => {
+        const summary = includeDemoComps === true
+          ? seedCanonicalCatalog(db)
+          : { ...seedStarterSkus(db), compsSeeded: 0 };
+        autopilot.refreshBuyBook();
+        return summary;
+      }),
+    tool('run_autopilot_pass', 'Optionally sync market data, then scan, triage, and reprice under the current mode.',
+      object({ tier: passTier, syncFirst: boolean, syncLimit: limit }), checkout, async ({ tier, syncFirst, syncLimit }) => {
+        const sync = syncFirst ? await syncMarketData(syncLimit) : null;
+        const pass = await autopilot.runAutopilotPass({ tier });
+        return { sync, pass };
+      }),
   ];
 }
 
@@ -435,6 +453,8 @@ function makeResources(runtime: SystemRuntime, autopilot: AutopilotEngine): Reso
     resource('audit/recent', 'Recent audit events', 'Most recent operational audit events.', () => db.listAuditEvents()),
     resource('buy-book', 'Buy Book', 'Precomputed entry thresholds, momentum, and polling tiers.', () => autopilot.getBuyBook().list()),
     resource('telemetry', 'Alpha telemetry', 'Latency, signal counts, and execution outcomes.', () => autopilot.getTelemetry().snapshot(db)),
+    resource('readiness', 'Readiness', 'Current operating readiness, configuration, and next actions.',
+      () => evaluateReadiness(runtime, { autopilot })),
   ];
 }
 
@@ -447,6 +467,7 @@ const prompts: McpPromptDefinition[] = [
   { name: 'daily_arbitrage_briefing', description: 'Summarize current metrics, P&L, and recent decisions.' },
   { name: 'incident_triage', description: 'Triage safety stops, operational failures, and failed orders.' },
   { name: 'autopilot_optimization', description: 'Review polling tiers, alpha signals, fill rates, and source throttling.' },
+  { name: 'autonomous_buyer', description: 'Use live readiness to set up and operate autonomous buying within operator limits.' },
 ];
 
 function promptResult(prompt: McpPromptDefinition, task: string, snapshot: unknown) {
@@ -610,6 +631,17 @@ export class ArbitrageMcpServer {
         buyBook: this.autopilot.getBuyBook().list(), telemetry: this.autopilot.getTelemetry().snapshot(db),
         autopilotConfig: this.autopilot.getAutopilotConfig(), systemState: db.getSystemState(),
       });
+    }
+    if (name === 'autonomous_buyer') {
+      return promptResult(prompt, [
+        'Start with check_readiness. Use .env.example to configure authorized services and restart the MCP server after edits.',
+        'If the catalog is empty, call bootstrap_catalog with includeDemoComps=false. Run sync_market_data and verify comp freshness and provider results.',
+        'With operator authorization, set_operating_mode to shadow and run_autopilot_pass to validate matching, valuations, and expected margins.',
+        'Review the shadow results and confirm live checkout authorization and spending limits with the operator before calling set_operating_mode with mode=live.',
+        'Recheck readyForLiveAutoBuy and checkoutCapability. Simulated checkout is for rehearsal only.',
+        'Run run_autopilot_pass on a schedule or use the autopilot daemon. Inspect sync errors, decisions, orders, and alerts after each pass.',
+        'Stop purchase activity if the kill switch engages. Use only sanctioned APIs and obtain explicit operator confirmation before approving an anomaly.',
+      ].join('\n'), evaluateReadiness(this.runtime, { autopilot: this.autopilot }));
     }
     return promptResult(prompt, 'Identify the likely failure and propose operator checks before resuming purchases. ' + instructions, {
       ...systemState(this.runtime), recentAuditEvents: db.listAuditEvents(20), failedOrders: db.listOrders('failed', 20),

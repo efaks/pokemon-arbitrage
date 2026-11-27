@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createSystemRuntime } from '../src/cli.ts';
 import type { SystemRuntimeOptions } from '../src/cli.ts';
 import type { AuditEvent, InventoryItem, PurchaseOrder } from '../src/domain/types.ts';
+import type { ReadinessReport } from '../src/engine/readiness.ts';
 import { ArbitrageMcpServer } from '../src/mcp/mcpServer.ts';
 import { JSON_RPC_ERROR_CODES as codes } from '../src/mcp/protocol.ts';
 import type {
@@ -27,11 +31,11 @@ const toolNames = [
   'upsert_catalog_sku', 'evaluate_listing', 'list_decisions', 'list_orders', 'approve_hitl_order', 'reject_hitl_order',
   'list_inventory', 'record_intake_qc', 'recommend_exit_channel', 'record_inventory_sale', 'list_audit_events',
   'get_buy_book', 'get_alpha_telemetry', 'ingest_webhook_listing', 'run_autonomous_triage', 'run_repricing_cycle',
-  'sync_market_data',
+  'sync_market_data', 'check_readiness', 'bootstrap_catalog', 'run_autopilot_pass',
 ];
-const resourceUris = ['state', 'hitl-queue', 'catalog', 'inventory', 'decisions/recent', 'audit/recent', 'buy-book', 'telemetry']
+const resourceUris = ['state', 'hitl-queue', 'catalog', 'inventory', 'decisions/recent', 'audit/recent', 'buy-book', 'telemetry', 'readiness']
   .map(path => 'pokemon-arbitrage://' + path);
-const promptNames = ['review_hitl_queue', 'daily_arbitrage_briefing', 'incident_triage', 'autopilot_optimization'];
+const promptNames = ['review_hitl_queue', 'daily_arbitrage_briefing', 'incident_triage', 'autopilot_optimization', 'autonomous_buyer'];
 
 function setup(t: TestContext, options: SystemRuntimeOptions = {}) {
   const runtime = createSystemRuntime({
@@ -102,13 +106,14 @@ test('MCP negotiates protocol versions and handles lifecycle messages and JSON-R
   assertRpcError(batch[2], codes.METHOD_NOT_FOUND);
 });
 
-test('MCP exposes exactly 22 validated tools, 8 resources, and 4 prompts', async t => {
+test('MCP exposes exactly 25 validated tools, 9 resources, and 5 prompts', async t => {
   const { send, server } = setup(t);
   const { tools } = result<{ tools: McpToolDefinition[] }>(await send('tools/list'));
   assert.deepEqual(tools.map(tool => tool.name), toolNames);
   assert.ok(tools.every(tool => tool.inputSchema.type === 'object' && tool.inputSchema.additionalProperties === false &&
     tool.description && typeof tool.annotations.readOnlyHint === 'boolean'));
   assert.equal(tools.find(tool => tool.name === 'evaluate_listing')?.annotations.readOnlyHint, true);
+  assert.equal(tools.find(tool => tool.name === 'check_readiness')?.annotations.readOnlyHint, true);
 
   const { resources } = result<{ resources: McpResourceDefinition[] }>(await send('resources/list'));
   assert.deepEqual(resources.map(resource => resource.uri), resourceUris);
@@ -131,10 +136,42 @@ test('MCP exposes exactly 22 validated tools, 8 resources, and 4 prompts', async
     toolCall(2, 'get_alpha_telemetry', { refresh: true }),
     toolCall(2, 'run_repricing_cycle', { inventoryId: 'existing' }),
     toolCall(2, 'sync_market_data', { limit: 1.5 }),
+    toolCall(2, 'check_readiness', { refresh: true }),
+    toolCall(2, 'bootstrap_catalog', { includeDemoComps: 'true' }),
+    toolCall(2, 'run_autopilot_pass', { tier: 'other' }),
+    toolCall(2, 'run_autopilot_pass', { syncFirst: 1 }),
+    toolCall(2, 'run_autopilot_pass', { syncLimit: 0 }),
     toolCall(2, 'unknown'), request(2, 'tools/call', []), request(2, 'resources/read', { uri: 'invalid' }),
     request(2, 'prompts/get', { name: 'review_hitl_queue', arguments: { focusOrderId: false } }),
   ];
   for (const call of invalidCalls) assertRpcError(await server.handleMessage(call), codes.INVALID_PARAMS);
+});
+
+test('MCP bootstraps the catalog, refreshes readiness, and runs a pass with optional sync', async t => {
+  const { data, runtime } = setup(t, { seedCatalog: false, envFileLoaded: true });
+  const empty = await data<ReadinessReport>('check_readiness');
+  assert.equal(empty.envFileLoaded, true);
+  assert.equal(empty.checkoutCapability, 'simulated');
+  assert.equal(empty.catalogSkuCount, 0);
+  assert.equal(empty.readyForShadowScan, false);
+  assert.deepEqual(await data('get_buy_book'), { entries: [] });
+  assert.deepEqual(await data('bootstrap_catalog'), { skusSeeded: 20, compsSeeded: 0 });
+  const seeded = await data<ReadinessReport>('check_readiness');
+  assert.equal(seeded.catalogSkuCount, 20);
+  assert.equal(seeded.freshCompSkuCount, 0);
+  assert.equal((await data<{ entries: unknown[] }>('get_buy_book')).entries.length, 20);
+  assert.deepEqual(await data('bootstrap_catalog', { includeDemoComps: true }), { skusSeeded: 20, compsSeeded: 202 });
+  assert.equal((await data<ReadinessReport>('check_readiness')).readyForShadowScan, true);
+  const result = await data<{
+    sync: { errorCount: number };
+    pass: { cycle: { fetchedCount: number; operatingMode: string }; buyBook: { standard: number } };
+  }>('run_autopilot_pass', { tier: 'all', syncFirst: true, syncLimit: 1 });
+  assert.equal(result.sync.errorCount, 0);
+  assert.equal(result.pass.cycle.fetchedCount, 17);
+  assert.equal(result.pass.cycle.operatingMode, 'shadow');
+  assert.ok(result.pass.buyBook.standard > 0);
+  assert.equal((await data<{ sync: null }>('run_autopilot_pass', { tier: 'standard' })).sync, null);
+  assert.equal(runtime.db.listAuditEvents(-1).filter(event => event.eventType === 'market.sync_completed').length, 1);
 });
 
 test('MCP sync_market_data returns provider totals and audits the run', async t => {
@@ -321,6 +358,7 @@ test('MCP reads all resources and renders all prompts from current data', async 
 
   assert.match(JSON.stringify(snapshots.get('pokemon-arbitrage://buy-book')), /maxAutoBuyAskCents/);
   assert.match(JSON.stringify(snapshots.get('pokemon-arbitrage://telemetry')), /detectToDecision/);
+  assert.deepEqual(snapshots.get('pokemon-arbitrage://readiness'), await data('check_readiness'));
 
   const focusOrderId = queue[0].id;
   for (const [name, args, expected] of [
@@ -328,6 +366,7 @@ test('MCP reads all resources and renders all prompts from current data', async 
     ['daily_arbitrage_briefing', undefined, ['pnlAttribution', 'recentDecisions', 'mock-ssp-bb-clean']],
     ['incident_triage', undefined, ['killSwitchEngaged', 'mcp.kill_switch_updated', 'Payment declined']],
     ['autopilot_optimization', undefined, ['buyBook', 'detectToDecision', 'autopilotConfig']],
+    ['autonomous_buyer', undefined, ['check_readiness', 'sync_market_data', 'run_autopilot_pass', 'Incident under review']],
   ] as const) {
     const { messages } = result<{ messages: McpPromptMessage[] }>(await send('prompts/get', { name, arguments: args }));
     assert.equal(messages.length, 1);
@@ -372,9 +411,14 @@ test('MCP Wave 5 tools share listing intake, triage, repricing, and telemetry', 
 });
 
 test('spawned MCP stdio CLI flushes every JSON-RPC response at EOF with clean stdout', { timeout: 10_000 }, async t => {
-  const child = spawn(process.execPath, ['src/cli.ts', 'mcp', '--db', ':memory:', '--mock', '--mode', 'live'], {
-    cwd: fileURLToPath(new URL('..', import.meta.url)),
-  });
+  const cwd = mkdtempSync(join(tmpdir(), 'arbitrage-mcp-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  writeFileSync(join(cwd, '.env'), 'ARBITRAGE_MODE=live\n');
+  const env = { ...process.env };
+  delete env.ARBITRAGE_MODE;
+  delete env.ARBITRAGE_SKIP_DOTENV;
+  const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
+  const child = spawn(process.execPath, [cli, 'mcp', '--db', ':memory:', '--mock'], { cwd, env });
   t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill(); });
   const closed = once(child, 'close');
   let stdout = '';
@@ -386,16 +430,16 @@ test('spawned MCP stdio CLI flushes every JSON-RPC response at EOF with clean st
     request(1, 'initialize', { protocolVersion: '2025-03-26' }), notification,
     request(2, 'tools/list'), toolCall(3, 'run_scan_cycle'), toolCall(4, 'get_system_state'),
     toolCall(5, 'ingest_webhook_listing', { ...cleanListing, listingId: 'stdio-push' }),
-    toolCall(6, 'get_alpha_telemetry'),
+    toolCall(6, 'get_alpha_telemetry'), toolCall(7, 'check_readiness'),
   ];
   child.stdin.end('\n{bad json}\n' + messages.map(message => JSON.stringify(message)).join('\n') + '\n');
   assert.deepEqual(await closed, [0, null], stderr);
   assert.ok(stdout.endsWith('\n'));
   const responses = stdout.slice(0, -1).split('\n').map(line => JSON.parse(line) as JsonRpcResponse);
-  assert.deepEqual(responses.map(response => response.id), [null, 1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(responses.map(response => response.id), [null, 1, 2, 3, 4, 5, 6, 7]);
   assertRpcError(responses[0], codes.PARSE_ERROR);
   assert.equal(result<McpInitializeResult>(responses[1]).protocolVersion, '2025-03-26');
-  assert.equal(result<{ tools: McpToolDefinition[] }>(responses[2]).tools.length, 22);
+  assert.equal(result<{ tools: McpToolDefinition[] }>(responses[2]).tools.length, 25);
   const scan = result<McpToolCallResult>(responses[3]);
   assert.equal(scan.isError, undefined);
   assert.equal((scan.structuredContent?.summary as { fetchedCount: number }).fetchedCount, 17);
@@ -404,6 +448,7 @@ test('spawned MCP stdio CLI flushes every JSON-RPC response at EOF with clean st
   const pushed = result<McpToolCallResult>(responses[5]);
   assert.equal((pushed.structuredContent?.decision as { action: string }).action, 'skip');
   assert.equal(result<McpToolCallResult>(responses[6]).structuredContent?.samplesCount, 1);
+  assert.equal(result<McpToolCallResult>(responses[7]).structuredContent?.envFileLoaded, true);
 });
 
 test('HTTP POST /mcp accepts requests, notifications, and batches on a loopback ephemeral port', async t => {

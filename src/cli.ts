@@ -1,6 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { seedCanonicalCatalog } from './catalog/seed.ts';
+import { seedCanonicalCatalog, seedStarterSkus } from './catalog/seed.ts';
 import { createConfig } from './config.ts';
 import type { ArbitrageConfig } from './config.ts';
 import type { SupplyConnector } from './connectors/base.ts';
@@ -16,6 +16,9 @@ import { OperatingMode } from './domain/types.ts';
 import type { CycleSummary, PurchaseOrder } from './domain/types.ts';
 import { AutopilotEngine } from './engine/autopilot.ts';
 import type { AutopilotCycleSummary } from './engine/autopilot.ts';
+import { evaluateReadiness } from './engine/readiness.ts';
+import type { ReadinessReport } from './engine/readiness.ts';
+import { loadProjectEnv } from './env.ts';
 import { EbayOrderApiExecutor, ExecutionCoordinator, SimulatedApiExecutor } from './execution/executor.ts';
 import { InventoryManager } from './liquidation/inventoryManager.ts';
 import { MockCertVerifier, PsaHttpCertVerifier } from './matching/certVerifier.ts';
@@ -33,6 +36,7 @@ export interface SystemRuntimeOptions {
   dbPath?: string;
   mode?: OperatingMode;
   useMock?: boolean;
+  envFileLoaded?: boolean;
   seedCatalog?: boolean;
   quiet?: boolean;
   configOverrides?: Partial<ArbitrageConfig>;
@@ -55,6 +59,8 @@ export interface SystemRuntime {
   pipeline: ArbitragePipeline;
   connectors: SupplyConnector[];
   marketSync: MarketSyncCoordinator;
+  useMock?: boolean;
+  envFileLoaded?: boolean;
 }
 
 export function createSystemRuntime(options: SystemRuntimeOptions = {}): SystemRuntime {
@@ -97,7 +103,10 @@ export function createSystemRuntime(options: SystemRuntimeOptions = {}): SystemR
       new EbaySoldCompsSyncer(options.useMock ? { enabled: false } : undefined),
     ]);
 
-    return { db, config, resolver, fmvEngine, riskEngine, executor, inventoryManager, pipeline, connectors, marketSync };
+    return {
+      db, config, resolver, fmvEngine, riskEngine, executor, inventoryManager, pipeline, connectors, marketSync,
+      useMock: options.useMock, envFileLoaded: options.envFileLoaded,
+    };
   } catch (error) {
     db.close();
     throw error;
@@ -177,8 +186,24 @@ function printAutopilot(summary: AutopilotCycleSummary): void {
   console.log(`Fill rate ${percentage.format(telemetry.fillRate)} · Miss rate ${percentage.format(telemetry.missRate)}`);
 }
 
+function printReadiness(report: ReadinessReport): void {
+  const { blockingIssues, warnings, recommendedNextActions, ...status } = report;
+  console.table(Object.entries(status).map(([check, value]) => ({
+    Check: check, Status: Array.isArray(value) ? value.join(', ') || '—' : value ?? '—',
+  })));
+  for (const [heading, items] of [
+    ['Blocking issues', blockingIssues], ['Warnings', warnings], ['Recommended next actions', recommendedNextActions],
+  ] as const) {
+    if (items.length === 0) continue;
+    console.log('\n' + heading);
+    for (const item of items) console.log('- ' + item);
+  }
+}
+
 const usage = `Usage: node src/cli.ts <command>
   demo
+  doctor [--db data/arbitrage.sqlite] [--mock] [--json]
+  bootstrap [--db data/arbitrage.sqlite]
   scan  [--mode shadow|hitl|live] [--db data/arbitrage.sqlite] [--mock]
   serve [--port 3000] [--mode hitl] [--db data/arbitrage.sqlite] [--mock] [--poll-ms 0]
   mcp   [--mode shadow|hitl|live] [--db data/arbitrage.sqlite] [--mock]
@@ -195,13 +220,14 @@ function integerOption(value: string, label: string, max: number): number {
 }
 
 async function main(args: string[]): Promise<void> {
+  const { loaded: envFileLoaded } = loadProjectEnv();
   const [command, ...flags] = args;
   if (command === '--help' || command === '-h') {
     console.log(usage);
     return;
   }
   if (command === 'demo' && flags.length === 0) return demo();
-  if (command !== 'scan' && command !== 'serve' && command !== 'mcp' && command !== 'autopilot' && command !== 'sync') {
+  if (!['scan', 'serve', 'mcp', 'autopilot', 'sync', 'bootstrap', 'doctor'].includes(command)) {
     throw new Error(usage);
   }
 
@@ -211,7 +237,7 @@ async function main(args: string[]): Promise<void> {
       mode: { type: 'string' }, db: { type: 'string' }, mock: { type: 'boolean' },
       port: { type: 'string' }, 'poll-ms': { type: 'string' },
       once: { type: 'boolean' }, 'hot-ms': { type: 'string' }, 'standard-ms': { type: 'string' }, 'reprice-ms': { type: 'string' },
-      'sync-ms': { type: 'string' }, limit: { type: 'string' },
+      'sync-ms': { type: 'string' }, limit: { type: 'string' }, json: { type: 'boolean' },
     },
   });
   const mode = Object.values(OperatingMode).find(candidate => candidate === values.mode);
@@ -221,9 +247,35 @@ async function main(args: string[]): Promise<void> {
   if (command !== 'autopilot' && [values.once, values['hot-ms'], values['standard-ms'], values['reprice-ms'], values['sync-ms']]
     .some(value => value !== undefined)) throw new Error(usage);
   if (command !== 'sync' && values.limit !== undefined) throw new Error(usage);
+  if (command !== 'doctor' && values.json !== undefined) throw new Error(usage);
+
+  if (['sync', 'doctor', 'bootstrap'].includes(command) && mode !== undefined) throw new Error(usage);
+  if ((command === 'sync' || command === 'bootstrap') && values.mock !== undefined) throw new Error(usage);
+
+  if (command === 'bootstrap') {
+    const { dbPath } = createConfig(values.db === undefined ? {} : { dbPath: values.db });
+    const db = new ArbitrageDatabase(dbPath);
+    try {
+      console.log(JSON.stringify({ ...seedStarterSkus(db), compsSeeded: 0, nextAction: 'npm run sync' }, null, 2));
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  if (command === 'doctor') {
+    const runtime = createSystemRuntime({ dbPath: values.db, useMock: values.mock, quiet: true, envFileLoaded });
+    try {
+      const report = evaluateReadiness(runtime);
+      if (values.json) console.log(JSON.stringify(report, null, 2));
+      else printReadiness(report);
+    } finally {
+      runtime.db.close();
+    }
+    return;
+  }
 
   if (command === 'sync') {
-    if (mode !== undefined || values.mock !== undefined) throw new Error(usage);
     const limit = integerOption(values.limit ?? '50', 'limit', Number.MAX_SAFE_INTEGER);
     if (limit === 0) throw new Error('--limit must be a positive integer');
     const { db, marketSync } = createSystemRuntime({ dbPath: values.db, quiet: true });
@@ -286,7 +338,7 @@ async function main(args: string[]): Promise<void> {
   }
 
   if (command === 'mcp') {
-    const runtime = createSystemRuntime({ dbPath: values.db, mode, useMock: values.mock, quiet: true });
+    const runtime = createSystemRuntime({ dbPath: values.db, mode, useMock: values.mock, quiet: true, envFileLoaded });
     const autopilot = new AutopilotEngine(runtime);
     const transport = new StdioMcpTransport(new ArbitrageMcpServer({ runtime, autopilot }));
     const shutdown = () => transport.stop();
@@ -304,10 +356,10 @@ async function main(args: string[]): Promise<void> {
 
   const port = integerOption(values.port ?? '3000', 'port', 65535);
   const pollMs = integerOption(values['poll-ms'] ?? '0', 'poll-ms', 2_147_483_647);
-  const runtime = createSystemRuntime({ dbPath: values.db, mode: mode ?? 'hitl', useMock: values.mock });
+  const runtime = createSystemRuntime({ dbPath: values.db, mode: mode ?? 'hitl', useMock: values.mock, envFileLoaded });
   const autopilot = new AutopilotEngine(runtime);
   const mcpServer = new ArbitrageMcpServer({ runtime, autopilot });
-  const server = createArbitrageServer({ ...runtime, autopilot, marketSync: runtime.marketSync, mcpHandler: mcpServer.createHttpHandler() });
+  const server = createArbitrageServer({ ...runtime, autopilot, mcpHandler: mcpServer.createHttpHandler() });
 
   try {
     await new Promise<void>((resolve, reject) => {

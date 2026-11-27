@@ -77,7 +77,8 @@ function mapItem(item: EbayItemSummary, fetchedAt: string): RawListing | undefin
     imageUrls: [...new Set(imageUrls)],
     seller: {
       sellerId: username, username, feedbackScore: item.seller?.feedbackScore ?? 0,
-      positivePercent: Number.isFinite(feedback) ? feedback : 0, accountAgeDays: 0, returnsAccepted: false,
+      positivePercent: Number.isFinite(feedback) ? feedback : 0,
+      accountAgeDays: 0, accountAgeUnknown: true, returnsAccepted: false,
     },
     supportsAutoCheckout: shippingCosts.length > 0,
     listedAt: Number.isFinite(createdAt) ? new Date(createdAt).toISOString() : fetchedAt,

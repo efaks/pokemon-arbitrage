@@ -141,11 +141,14 @@ export class EbayOrderApiExecutor implements ExecutionAdapter {
       clientId: process.env.EBAY_CLIENT_ID, clientSecret: process.env.EBAY_CLIENT_SECRET,
       sandbox: options.sandbox, fetchFn: this.fetchFn,
     };
+    const refreshToken = options.guestCheckout ? '' : process.env.EBAY_REFRESH_TOKEN;
+    const orderUsesOAuth = Boolean(options.guestCheckout || refreshToken?.trim());
     this.orderTokenProvider = options.tokenProvider ?? (options.accessToken === ''
       ? new EbayOAuthTokenManager({ staticToken: '' })
       : new EbayOAuthTokenManager({
-        ...oauthOptions, staticToken: options.accessToken ?? process.env.EBAY_ORDER_API_TOKEN ?? '',
-        refreshToken: options.guestCheckout ? '' : process.env.EBAY_REFRESH_TOKEN,
+        ...oauthOptions, ...(orderUsesOAuth ? {} : { clientId: '', clientSecret: '' }),
+        staticToken: options.accessToken ?? process.env.EBAY_ORDER_API_TOKEN ?? '',
+        refreshToken,
         scopes: options.guestCheckout ? ['https://api.ebay.com/oauth/api_scope/buy.guest.order'] : undefined,
       }));
     const browseToken = (options.browseAccessToken ?? process.env.EBAY_ACCESS_TOKEN)?.trim();

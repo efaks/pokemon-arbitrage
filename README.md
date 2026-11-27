@@ -2,6 +2,8 @@
 
 A local TypeScript system that scans marketplace and retailer listings, estimates resale margins, and manages purchase review, inventory, and realized P&L. It runs on Node.js 26 with built-in SQLite and no external runtime dependencies.
 
+See [AGENTS.md](AGENTS.md) for Muse and MCP setup, the autonomous buying loop, and operator guardrails. Copy [.env.example](.env.example) to a local `.env` to configure credentials and optional limits.
+
 ## Architecture
 
 1. **Supply connectors** normalize configured eBay, Best Buy, Costco Wholesale, Pokémon Center, Shopify storefront, and TCGplayer feeds into USD listings. The pipeline deduplicates unchanged listings before evaluation. The mock connector provides a repeatable fixture feed.
@@ -35,6 +37,8 @@ Run commands from the repository root with Node.js 26. Install the development d
 | Command | Purpose |
 | --- | --- |
 | `npm run demo` | Run a simulated live scan in memory and print purchases, review items, and skipped listings. |
+| `npm run doctor` | Review configuration, comp freshness, and operating readiness. Use `npm run --silent doctor -- --json` for JSON-only output. |
+| `npm run bootstrap` | Upsert 20 starter SKUs without fixture sales. Run market sync afterward. |
 | `npm run scan -- --mock --db :memory: --mode shadow` | Run one scan and print the results. |
 | `npm run sync -- --db data/arbitrage.sqlite --limit 50` | Import market data from configured providers and print a JSON summary. |
 | `npm run serve -- --mock --db :memory: --mode hitl --port 3000` | Serve the loopback dashboard and MCP HTTP endpoint. Add `--poll-ms 60000` for recurring scans. |
@@ -64,6 +68,7 @@ Fulfillment recommends immediate buylist when its net profit clears the configur
 | --- | --- |
 | `GET /api/buy-book?tier=hot&refresh=true` | Read entries, optionally filtering by hot, standard, or cold and rebuilding the book. |
 | `GET /api/telemetry` | Read alpha, latency, and source performance metrics. |
+| `GET /api/readiness` | Read the same configuration and catalog readiness report as `doctor --json`. |
 | `POST /api/webhooks/listing` | Push a listing through the fast path under the persisted operating mode. |
 | `POST /api/autopilot/pass` | Run a pass using optional JSON field `tier` with `all`, `hot`, `standard`, or `cold`. |
 | `POST /api/sync` | Run market sync using an optional positive integer `limit`, then refresh the Buy Book. |
@@ -80,18 +85,18 @@ Supply the source's stable `listingId`, actual seller profile, and checkout capa
 
 ## MCP integration
 
-The server negotiates `2025-03-26` and `2024-11-05`. It exposes 22 tools, 8 resources, and 4 prompts over both transports.
+The server negotiates `2025-03-26` and `2024-11-05`. It exposes 25 tools, 9 resources, and 5 prompts over both transports.
 
 **Stdio.** Launch `node src/cli.ts mcp` directly from a client. The process reads one JSON-RPC frame per line from stdin and writes only JSON-RPC frames to stdout. Use the Node command in client configuration to keep npm's script banner out of the stream.
 
-The repository's `.mcp.json` configures a local HITL server. Set absolute paths for the CLI and database if your client launches it from another directory.
+The repository's `.mcp.json` uses the persisted SQLite mode unless `ARBITRAGE_MODE` sets the startup mode. Use the repository root as the launch directory for automatic `.env` loading. Set absolute paths for the CLI and database if your client launches it from another directory.
 
 ```json
 {
   "mcpServers": {
     "pokemon-arbitrage": {
       "command": "node",
-      "args": ["src/cli.ts", "mcp", "--db", "data/arbitrage.sqlite", "--mode", "hitl"]
+      "args": ["src/cli.ts", "mcp", "--db", "data/arbitrage.sqlite"]
     }
   }
 }
@@ -127,6 +132,9 @@ Use `tools/list` for input schemas and `tools/call` with `params.name` and `para
 | `run_autonomous_triage` | Process the review queue with optional `maxApproveCents` and `autoRejectAnomalies`. |
 | `run_repricing_cycle` | Update local listing records based on item age, exit channel, and profit floor. |
 | `sync_market_data` | Import market data and refresh the Buy Book. Accepts an optional positive integer `limit`. |
+| `check_readiness` | Check operating mode, kill switch, comp freshness, feed configuration, and checkout capability. |
+| `bootstrap_catalog` | Upsert the starter SKUs and refresh the Buy Book. Set `includeDemoComps: true` only in a demo database. |
+| `run_autopilot_pass` | Scan, triage, and reprice. Accepts optional `tier` (`all`, `hot`, `standard`, or `cold`), `syncFirst`, and positive integer `syncLimit`. Returns the pass and optional sync summary. |
 
 `run_scan_cycle` with `useMock: true` selects the fixture feed and seeds an empty catalog. The runtime's verifier and checkout adapter are selected at startup. Launch with `--mock` to simulate the whole workflow. `evaluate_listing` supplies a hypothetical trusted seller when seller data is omitted. Supply the actual seller profile when assessing seller trust.
 
@@ -144,6 +152,7 @@ Read these JSON snapshots with `resources/read`.
 | `pokemon-arbitrage://audit/recent` | Recent audit events. |
 | `pokemon-arbitrage://buy-book` | SKU buy thresholds, momentum, and polling tiers. |
 | `pokemon-arbitrage://telemetry` | Latency, alpha signal counts, and source execution outcomes. |
+| `pokemon-arbitrage://readiness` | Live readiness report with blockers, warnings, and next actions. |
 
 ### Prompts
 
@@ -155,6 +164,7 @@ Retrieve a prompt with `prompts/get`.
 | `daily_arbitrage_briefing` | Current metrics, P&L attribution, and recent decisions. |
 | `incident_triage` | System state, kill switch status, recent audit events, and failed orders. |
 | `autopilot_optimization` | Buy Book tiers, alpha telemetry, settings, and system state. |
+| `autonomous_buyer` | Current readiness and the setup, shadow, and buying loop for Muse and MCP agents. |
 
 ## Costco Wholesale and Pokémon Center feeds
 
@@ -169,7 +179,7 @@ Both feeds accept optional `upc`, `description`, `imageUrl`, and `shippingCents`
 
 ## Environment variables
 
-Export connector credentials for the process that launches the CLI or MCP server.
+The CLI loads `.env` from the working directory, including when launched over MCP stdio. Shell variables take precedence. Set `ARBITRAGE_SKIP_DOTENV=1` in the shell to skip loading, and restart the process after editing `.env`. Keep `.env` out of version control.
 
 | Variable | Use |
 | --- | --- |
@@ -177,7 +187,7 @@ Export connector credentials for the process that launches the CLI or MCP server
 | `EBAY_CLIENT_SECRET` | eBay OAuth client secret. OAuth tokens are cached in memory and refreshed near expiry. |
 | `EBAY_REFRESH_TOKEN` | Consented user refresh token for eBay member checkout. Requires both client credentials and approved Order API access. |
 | `EBAY_ACCESS_TOKEN` | Static Browse access token for use without OAuth client credentials. |
-| `EBAY_ORDER_API_TOKEN` | Static Order API user access token for use without OAuth client credentials. |
+| `EBAY_ORDER_API_TOKEN` | Static Order API user access token for use without member OAuth credentials. |
 | `POKEMON_TCG_API_KEY` | Enables the Pokémon TCG API catalog and TCGplayer market price sync. |
 | `PRICECHARTING_API_TOKEN` | Enables PriceCharting price snapshots. |
 | `EBAY_INSIGHTS_ENABLED` | Set to `true` to enable sold comps with an approved Marketplace Insights token or OAuth credentials. |
@@ -235,6 +245,6 @@ TCGplayer and PriceCharting imports are market price snapshots that feed valuati
 
 1. Run `npm test` and `npm run demo`, then create a separate database for real data. Keep it in shadow mode while validating feeds.
 2. Configure eBay application credentials. For member checkout, confirm production Order API approval and obtain a refresh token with the appropriate member permissions. Enable Marketplace Insights only after confirming entitlement and category access. [eBay Order API](https://developer.ebay.com/api-docs/buy/api-order.html)
-3. Configure the market data providers you use, run a small sync, and review its errors, catalog matches, prices, and Buy Book entries.
+3. Run `npm run bootstrap` to seed the starter catalog. Configure the market data providers you use, run a small sync, and review its errors, catalog matches, prices, and Buy Book entries. Use `npm run doctor` to check comp freshness and setup blockers.
 4. Set the vision URL and key if you use live photo assessment. Configure your webhook and confirm it receives alerts during a pilot scan.
 5. Review spend caps, cash reserve, per-SKU limits, and the kill switch. Review real decisions in shadow and then in HITL before enabling live checkout. In HITL, the autopilot daemon can approve eligible orders under its autonomous policy.

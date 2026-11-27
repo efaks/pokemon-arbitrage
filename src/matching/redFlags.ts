@@ -49,8 +49,10 @@ export function evaluateSellerTrust(seller: SellerProfile, config: ArbitrageConf
   const checks = [
     { value: seller.feedbackScore, minimum: config.sellerMinFeedback, label: 'Feedback score' },
     { value: seller.positivePercent, minimum: config.sellerMinPositivePercent, label: 'Positive feedback percent' },
-    { value: seller.accountAgeDays, minimum: config.sellerMinAccountAgeDays, label: 'Account age in days' },
   ];
+  if (seller.accountAgeUnknown !== true) {
+    checks.push({ value: seller.accountAgeDays, minimum: config.sellerMinAccountAgeDays, label: 'Account age in days' });
+  }
   const reasons: string[] = [];
   const scores = checks.map(({ value, minimum, label }) => {
     if (Number.isFinite(value) && value >= minimum) return 1;

@@ -2,7 +2,7 @@
   "mcpServers": {
     "pokemon-arbitrage": {
       "command": "node",
-      "args": ["src/cli.ts", "mcp", "--db", "data/arbitrage.sqlite", "--mode", "hitl"]
+      "args": ["src/cli.ts", "mcp", "--db", "data/arbitrage.sqlite"]
     }
   }
 }

@@ -2,11 +2,13 @@ import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { resolve } from 'node:path';
+import type { SystemRuntime } from '../cli.ts';
 import type { ArbitrageConfig } from '../config.ts';
 import type { ArbitrageDatabase } from '../db/database.ts';
 import { CardCondition, DecisionAction, ExitChannel, OperatingMode, OrderStatus } from '../domain/types.ts';
 import type { RawListing } from '../domain/types.ts';
 import type { AutopilotEngine } from '../engine/autopilot.ts';
+import { evaluateReadiness } from '../engine/readiness.ts';
 import { parseWebhookListing } from '../mcp/mcpServer.ts';
 import type { InventoryManager } from '../liquidation/inventoryManager.ts';
 import type { ArbitragePipeline } from '../pipeline/arbitragePipeline.ts';
@@ -17,7 +19,7 @@ export type McpHttpHandler = (
   payload: unknown, reqHeaders?: Record<string, string | string[] | undefined>,
 ) => Promise<{ status: number; body?: unknown; headers?: Record<string, string> }>;
 
-export interface ArbitrageServerOptions {
+export interface ArbitrageServerOptions extends Partial<Pick<SystemRuntime, 'connectors' | 'useMock' | 'envFileLoaded'>> {
   pipeline: ArbitragePipeline;
   db: ArbitrageDatabase;
   inventoryManager: InventoryManager;
@@ -142,6 +144,9 @@ export function createArbitrageServer(options: ArbitrageServerOptions): Server {
         }
         case '/api/health':
           json(res, 200, { status: 'ok' });
+          return;
+        case '/api/readiness':
+          json(res, 200, evaluateReadiness({ ...options, fmvEngine }, { autopilot }));
           return;
         case '/api/state':
           json(res, 200, db.getDashboardMetrics(config));
