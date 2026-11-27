@@ -23,10 +23,11 @@ import type { ImportCompInput } from '../src/sync/compImporter.ts';
 import { priceChartingFieldForSku } from '../src/sync/marketSync.ts';
 
 const nowIso = '2026-11-26T12:00:00.000Z';
+const photoUrl = 'https://images.example.test/pikachu.jpg';
 const sku: CanonicalSku = {
   id: 'wave8-card', name: 'Pikachu ex', assetClass: 'graded', grader: 'PSA', grade: '10',
   setName: 'Test Set', setCode: 'TST', language: 'EN', variant: 'standard', aliases: [],
-  referenceImageUrl: 'https://images.example.test/pikachu.jpg', createdAt: nowIso, updatedAt: nowIso,
+  referenceImageUrl: photoUrl, createdAt: nowIso, updatedAt: nowIso,
 };
 const item: InventoryItem = {
   id: 'item/1', orderId: 'order-1', skuId: sku.id, skuName: sku.name, assetClass: 'graded',
@@ -252,12 +253,25 @@ test('eBay reuses a retained unpublished offer after withdrawal', async () => {
       return new Response(null, { status: 204 });
     },
   });
-  const result = await adapter.publishListing(item, sku, { priceCents: 15_200 });
+  const result = await adapter.publishListing(item, sku, { priceCents: 15_200, imageUrls: [photoUrl] });
   assert.equal(result.externalListingId, 'second-listing');
   assert.deepEqual(steps, [
     'PUT /inventory_item/pa-item%2F1', 'POST /offer', 'GET /offer',
     'PUT /offer/prior-offer', 'POST /offer/prior-offer/publish',
   ]);
+});
+
+test('eBay requires a valid HTTPS photo before writing a listing', async () => {
+  const adapter = new EbaySellInventoryAdapter({
+    ...tokenSettings, fetchFn: async () => assert.fail('Photo validation must happen before fetching'),
+  });
+  const result = await adapter.publishListing(item, { ...sku, referenceImageUrl: undefined }, {
+    priceCents: 15_200, imageUrls: ['http://images.example.test/pikachu.jpg', 'https://'],
+  });
+  assert.deepEqual(result, {
+    success: false,
+    failureReason: 'eBay publishing requires at least one HTTPS photo URL; pass imageUrls or set referenceImageUrl on the SKU',
+  });
 });
 
 test('InventoryManager publishes at FMV, syncs reprices, and clears active fields only after withdrawal', async t => {

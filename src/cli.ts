@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
-import { extname } from 'node:path';
+import { extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { installCatalogPack, listCatalogPacks } from './catalog/catalogPacks.ts';
 import { seedCanonicalCatalog, seedStarterSkus } from './catalog/seed.ts';
 import { createConfig } from './config.ts';
 import type { ArbitrageConfig } from './config.ts';
@@ -22,6 +23,7 @@ import { evaluateReadiness } from './engine/readiness.ts';
 import type { ReadinessReport } from './engine/readiness.ts';
 import { loadProjectEnv } from './env.ts';
 import { EbayOrderApiExecutor, ExecutionCoordinator, SimulatedApiExecutor } from './execution/executor.ts';
+import { EbayFulfillmentAdapter, SalesReconciler, SimulatedFulfillmentAdapter } from './liquidation/ebayFulfillment.ts';
 import { InventoryManager } from './liquidation/inventoryManager.ts';
 import { EbaySellInventoryAdapter, SimulatedSellerAdapter } from './liquidation/ebaySellerAdapter.ts';
 import { MockCertVerifier, PsaHttpCertVerifier } from './matching/certVerifier.ts';
@@ -32,6 +34,8 @@ import { StdioMcpTransport } from './mcp/stdioTransport.ts';
 import { CompositeNotifier, ConsoleNotifier, NullNotifier, WebhookNotifier } from './notifications/notifier.ts';
 import { ArbitragePipeline } from './pipeline/arbitragePipeline.ts';
 import { createArbitrageServer } from './server/httpServer.ts';
+import { buildSetupGuide } from './setup/configManager.ts';
+import { redactSecrets, rememberConfiguredSecrets } from './setup/secrets.ts';
 import { importSoldComps, parseSoldCompsCsv } from './sync/compImporter.ts';
 import type { ImportCompInput } from './sync/compImporter.ts';
 import { EbaySoldCompsSyncer, MarketSyncCoordinator, PokemonTcgApiCatalogSyncer, PriceChartingSyncer } from './sync/marketSync.ts';
@@ -42,6 +46,7 @@ export interface SystemRuntimeOptions {
   mode?: OperatingMode;
   useMock?: boolean;
   envFileLoaded?: boolean;
+  envPath?: string;
   seedCatalog?: boolean;
   quiet?: boolean;
   configOverrides?: Partial<ArbitrageConfig>;
@@ -61,14 +66,20 @@ export interface SystemRuntime {
   riskEngine: RiskEngine;
   executor: ExecutionCoordinator;
   inventoryManager: InventoryManager;
+  salesReconciler: SalesReconciler;
   pipeline: ArbitragePipeline;
   connectors: SupplyConnector[];
   marketSync: MarketSyncCoordinator;
   useMock?: boolean;
   envFileLoaded?: boolean;
+  envPath?: string;
+  quiet?: boolean;
+  simulationOverrides?: SystemRuntimeOptions['simulationOverrides'];
 }
 
 export function createSystemRuntime(options: SystemRuntimeOptions = {}): SystemRuntime {
+  const envPath = resolve(options.envPath ?? '.env');
+  const envFileLoaded = options.envFileLoaded ?? (options.envPath ? loadProjectEnv(envPath).loaded : undefined);
   const config = createConfig({
     ...options.configOverrides,
     ...(options.dbPath !== undefined ? { dbPath: options.dbPath } : {}),
@@ -79,44 +90,61 @@ export function createSystemRuntime(options: SystemRuntimeOptions = {}): SystemR
     if (options.seedCatalog ?? options.useMock) seedCanonicalCatalog(db);
     const envMode = Object.values(OperatingMode).find(mode => mode === process.env.ARBITRAGE_MODE?.trim());
     const explicitMode = options.mode ?? options.configOverrides?.operatingMode ?? envMode;
+    config.operatingMode = explicitMode ?? db.getSystemState().operatingMode;
+    const components = buildRuntimeComponents(db, config, options);
     if (explicitMode !== undefined) db.setOperatingMode(explicitMode);
-    config.operatingMode = db.getSystemState().operatingMode;
-
-    const connectors = options.useMock
-      ? [new MockScenarioConnector()]
-      : [
-        new EbayBrowseConnector(), new BestBuyApiConnector(), new CostcoConnector(), new PokemonCenterConnector(),
-        new ShopifyStorefrontConnector(), new TcgplayerFeedConnector(),
-      ];
-    const certVerifier = options.useMock ? new MockCertVerifier() : new PsaHttpCertVerifier();
-    const visionVerifier = !options.useMock && process.env.VISION_API_KEY?.trim() && process.env.VISION_API_URL?.trim()
-      ? new OpenAICompatibleVisionVerifier() : new HeuristicVisionVerifier();
-    const resolver = new EntityResolver({ config, certVerifier, visionVerifier });
-    const fmvEngine = new FmvEngine();
-    const riskEngine = new RiskEngine();
-    // The coordinator checks the persisted mode. Keep the real adapter ready for dashboard mode changes.
-    const adapter = options.useMock ? new SimulatedApiExecutor(options.simulationOverrides) : new EbayOrderApiExecutor();
-    const executor = new ExecutionCoordinator({ db, config, adapter });
-    const sellerAdapter = options.useMock ? new SimulatedSellerAdapter() : new EbaySellInventoryAdapter();
-    const inventoryManager = new InventoryManager(db, fmvEngine, config, sellerAdapter);
-    const notifier = !options.useMock && process.env.ARBITRAGE_WEBHOOK_URL?.trim()
-      ? new CompositeNotifier([new WebhookNotifier(), ...(options.quiet ? [] : [new ConsoleNotifier()])])
-      : options.quiet ? new NullNotifier() : new ConsoleNotifier();
-    const pipeline = new ArbitragePipeline({ db, config, connectors, resolver, fmvEngine, riskEngine, executor, notifier });
-    const marketSync = new MarketSyncCoordinator(db, [
-      new PokemonTcgApiCatalogSyncer(options.useMock ? { apiKey: '' } : undefined),
-      new PriceChartingSyncer(options.useMock ? { apiToken: '' } : undefined),
-      new EbaySoldCompsSyncer(options.useMock ? { enabled: false } : undefined),
-    ]);
-
-    return {
-      db, config, resolver, fmvEngine, riskEngine, executor, inventoryManager, pipeline, connectors, marketSync,
-      useMock: options.useMock, envFileLoaded: options.envFileLoaded,
-    };
+    return { db, config, ...components, envPath, envFileLoaded, useMock: options.useMock, quiet: options.quiet,
+      simulationOverrides: options.simulationOverrides };
   } catch (error) {
     db.close();
     throw error;
   }
+}
+
+function buildRuntimeComponents(db: ArbitrageDatabase, config: ArbitrageConfig, options: SystemRuntimeOptions) {
+  const connectors = options.useMock
+    ? [new MockScenarioConnector()]
+    : [
+      new EbayBrowseConnector(), new BestBuyApiConnector(), new CostcoConnector(), new PokemonCenterConnector(),
+      new ShopifyStorefrontConnector(), new TcgplayerFeedConnector(),
+    ];
+  const certVerifier = options.useMock ? new MockCertVerifier() : new PsaHttpCertVerifier();
+  const visionVerifier = !options.useMock && process.env.VISION_API_KEY?.trim() && process.env.VISION_API_URL?.trim()
+    ? new OpenAICompatibleVisionVerifier() : new HeuristicVisionVerifier();
+  const resolver = new EntityResolver({ config, certVerifier, visionVerifier });
+  const fmvEngine = new FmvEngine();
+  const riskEngine = new RiskEngine();
+  // The coordinator checks the persisted mode. Keep the real adapter ready for dashboard mode changes.
+  const adapter = options.useMock ? new SimulatedApiExecutor(options.simulationOverrides) : new EbayOrderApiExecutor();
+  const executor = new ExecutionCoordinator({ db, config, adapter });
+  const sellerAdapter = options.useMock ? new SimulatedSellerAdapter() : new EbaySellInventoryAdapter();
+  const inventoryManager = new InventoryManager(db, fmvEngine, config, sellerAdapter);
+  const fulfillmentAdapter = options.useMock ? new SimulatedFulfillmentAdapter() : new EbayFulfillmentAdapter();
+  const salesReconciler = new SalesReconciler(db, inventoryManager, fulfillmentAdapter);
+  const notifier = !options.useMock && process.env.ARBITRAGE_WEBHOOK_URL?.trim()
+    ? new CompositeNotifier([new WebhookNotifier(), ...(options.quiet ? [] : [new ConsoleNotifier()])])
+    : options.quiet ? new NullNotifier() : new ConsoleNotifier();
+  const pipeline = new ArbitragePipeline({ db, config, connectors, resolver, fmvEngine, riskEngine, executor, notifier });
+  const marketSync = new MarketSyncCoordinator(db, [
+    new PokemonTcgApiCatalogSyncer(options.useMock ? { apiKey: '' } : undefined),
+    new PriceChartingSyncer(options.useMock ? { apiToken: '' } : undefined),
+    new EbaySoldCompsSyncer(options.useMock ? { enabled: false } : undefined),
+  ]);
+
+  return { resolver, fmvEngine, riskEngine, executor, inventoryManager, salesReconciler, pipeline, connectors, marketSync };
+}
+
+export function reloadSystemRuntime(runtime: SystemRuntime): SystemRuntime {
+  // Capture credentials used by in-flight adapters before replacing file values.
+  rememberConfiguredSecrets();
+  const envFileLoaded = loadProjectEnv(runtime.envPath, { reload: true }).loaded;
+  const { db, useMock } = runtime;
+  const persistedMode = db.getSystemState().operatingMode;
+  const envMode = Object.values(OperatingMode).find(mode => mode === process.env.ARBITRAGE_MODE?.trim());
+  const config = createConfig({ dbPath: runtime.config.dbPath, operatingMode: useMock ? persistedMode : envMode ?? persistedMode });
+  const components = buildRuntimeComponents(db, config, runtime);
+  if (config.operatingMode !== persistedMode) db.setOperatingMode(config.operatingMode);
+  return Object.assign(runtime, components, { config, envFileLoaded });
 }
 
 const percentage = new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 1 });
@@ -129,7 +157,7 @@ function printCycle(summary: CycleSummary): void {
     Skipped: summary.skippedCount, Shadow: summary.shadowRecordedCount, Errors: summary.errorCount,
     'Circuit breaker': summary.killSwitchTriggered ? 'Tripped' : '—',
   }]);
-  for (const error of summary.errors) console.error(error);
+  for (const error of summary.errors) console.error(redactSecrets(error));
 }
 
 function orderDetails(order: PurchaseOrder) {
@@ -183,7 +211,8 @@ function printAutopilot(summary: AutopilotCycleSummary): void {
     Inventory: action.inventoryId, Route: action.fulfillment.route, Channel: action.listedChannel,
     'Listed price': formatUsd(action.listedPriceCents), 'Expected net': formatUsd(action.expectedNetProfitCents),
   })));
-  for (const error of errors ?? []) console.error(`Repricing failed for ${error}`);
+  for (const error of errors ?? []) console.error(`Repricing failed for ${redactSecrets(error)}`);
+  if (summary.reconciliation) console.log('Sale reconciliation', redactSecrets(summary.reconciliation));
   const { detectToDecision, decisionToFill, ...telemetry } = summary.telemetry;
   console.log(`Latency telemetry (${telemetry.samplesCount} decisions, milliseconds)`);
   const roundLatency = ({ p50Ms, p95Ms, p99Ms, maxMs }: typeof detectToDecision) => ({
@@ -211,8 +240,11 @@ const usage = `Usage: node src/cli.ts <command>
   demo
   doctor [--db data/arbitrage.sqlite] [--mock] [--json]
   bootstrap [--db data/arbitrage.sqlite]
+  setup [--db data/arbitrage.sqlite] [--json]
+  expand-catalog [--pack all_curated] [--db data/arbitrage.sqlite]
+  reconcile-sales [--db data/arbitrage.sqlite] [--mock]
   scan  [--mode shadow|hitl|live] [--db data/arbitrage.sqlite] [--mock]
-  serve [--port 3000] [--mode hitl] [--db data/arbitrage.sqlite] [--mock] [--poll-ms 0]
+  serve [--host 127.0.0.1] [--port 3000] [--mode shadow|hitl|live] [--db data/arbitrage.sqlite] [--mock] [--poll-ms 0]
   mcp   [--mode shadow|hitl|live] [--db data/arbitrage.sqlite] [--mock]
   sync  [--db data/arbitrage.sqlite] [--limit 50]
   import-comps --file <path> [--db data/arbitrage.sqlite]
@@ -235,7 +267,7 @@ async function main(args: string[]): Promise<void> {
     return;
   }
   if (command === 'demo' && flags.length === 0) return demo();
-  if (!['scan', 'serve', 'mcp', 'autopilot', 'sync', 'bootstrap', 'doctor', 'import-comps'].includes(command)) {
+  if (!['scan', 'serve', 'mcp', 'autopilot', 'sync', 'bootstrap', 'doctor', 'import-comps', 'setup', 'expand-catalog', 'reconcile-sales'].includes(command)) {
     throw new Error(usage);
   }
 
@@ -243,23 +275,24 @@ async function main(args: string[]): Promise<void> {
     args: flags,
     options: {
       mode: { type: 'string' }, db: { type: 'string' }, mock: { type: 'boolean' },
-      port: { type: 'string' }, 'poll-ms': { type: 'string' },
+      port: { type: 'string' }, host: { type: 'string' }, pack: { type: 'string' }, 'poll-ms': { type: 'string' },
       once: { type: 'boolean' }, 'hot-ms': { type: 'string' }, 'standard-ms': { type: 'string' }, 'reprice-ms': { type: 'string' },
       'sync-ms': { type: 'string' }, limit: { type: 'string' }, json: { type: 'boolean' }, file: { type: 'string' },
     },
   });
   const mode = Object.values(OperatingMode).find(candidate => candidate === values.mode);
   if (values.mode !== undefined && mode === undefined) throw new Error('--mode must be shadow, hitl, or live');
-  if (command !== 'serve' && (values.port !== undefined || values['poll-ms'] !== undefined)) throw new Error(usage);
+  if (command !== 'serve' && (values.host !== undefined || values.port !== undefined || values['poll-ms'] !== undefined)) throw new Error(usage);
 
   if (command !== 'autopilot' && [values.once, values['hot-ms'], values['standard-ms'], values['reprice-ms'], values['sync-ms']]
     .some(value => value !== undefined)) throw new Error(usage);
   if (command !== 'sync' && values.limit !== undefined) throw new Error(usage);
-  if (command !== 'doctor' && values.json !== undefined) throw new Error(usage);
+  if (command !== 'expand-catalog' && values.pack !== undefined) throw new Error(usage);
+  if (command !== 'doctor' && command !== 'setup' && values.json !== undefined) throw new Error(usage);
   if (command !== 'import-comps' && values.file !== undefined) throw new Error(usage);
 
-  if (['sync', 'doctor', 'bootstrap', 'import-comps'].includes(command) && mode !== undefined) throw new Error(usage);
-  if (['sync', 'bootstrap', 'import-comps'].includes(command) && values.mock !== undefined) throw new Error(usage);
+  if (['sync', 'doctor', 'bootstrap', 'import-comps', 'setup', 'expand-catalog', 'reconcile-sales'].includes(command) && mode !== undefined) throw new Error(usage);
+  if (['sync', 'bootstrap', 'import-comps', 'setup', 'expand-catalog'].includes(command) && values.mock !== undefined) throw new Error(usage);
 
   if (command === 'import-comps') {
     if (!values.file) throw new Error('import-comps requires --file');
@@ -289,12 +322,52 @@ async function main(args: string[]): Promise<void> {
     return;
   }
 
+  if (command === 'expand-catalog') {
+    const pack = listCatalogPacks().find(candidate => candidate.name === (values.pack ?? 'all_curated'))?.name;
+    if (!pack) throw new Error('Unknown catalog pack');
+    const db = new ArbitrageDatabase(createConfig(values.db === undefined ? {} : { dbPath: values.db }).dbPath);
+    try {
+      console.log(JSON.stringify(installCatalogPack(db, pack), null, 2));
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  if (command === 'reconcile-sales') {
+    const runtime = createSystemRuntime({ dbPath: values.db, useMock: values.mock, quiet: true, envFileLoaded });
+    try {
+      console.log(JSON.stringify(redactSecrets(await runtime.salesReconciler.reconcileSoldOrders()), null, 2));
+    } finally {
+      runtime.db.close();
+    }
+    return;
+  }
+
+  if (command === 'setup') {
+    const runtime = createSystemRuntime({ dbPath: values.db, quiet: true, envFileLoaded });
+    try {
+      const report = buildSetupGuide(runtime);
+      if (values.json) console.log(JSON.stringify(report, null, 2));
+      else {
+        console.log(`Setup ${report.setupProgressPct}% complete`);
+        for (const step of report.steps) {
+          console.log(`\n${step.id} (${step.status})`);
+          for (const instruction of step.userInstructions) console.log('- ' + instruction);
+        }
+      }
+    } finally {
+      runtime.db.close();
+    }
+    return;
+  }
+
   if (command === 'doctor') {
     const runtime = createSystemRuntime({ dbPath: values.db, useMock: values.mock, quiet: true, envFileLoaded });
     try {
       const report = evaluateReadiness(runtime);
-      if (values.json) console.log(JSON.stringify(report, null, 2));
-      else printReadiness(report);
+      if (values.json) console.log(JSON.stringify(redactSecrets(report), null, 2));
+      else printReadiness(redactSecrets(report));
     } finally {
       runtime.db.close();
     }
@@ -325,6 +398,14 @@ async function main(args: string[]): Promise<void> {
     const syncIntervalMs = values['sync-ms'] === undefined ? undefined : interval('sync-ms', '');
     const runtime = createSystemRuntime({ dbPath: values.db, mode, useMock: values.mock, quiet: values.once === true });
     const autopilot = new AutopilotEngine(runtime);
+    const reload = () => {
+      try {
+        reloadSystemRuntime(runtime);
+        autopilot.refreshBuyBook();
+      } catch (error) {
+        console.error('Autopilot configuration reload failed', redactSecrets(error instanceof Error ? error.message : String(error)));
+      }
+    };
     try {
       if (values.once) {
         printAutopilot(await autopilot.runAutopilotPass());
@@ -337,12 +418,14 @@ async function main(args: string[]): Promise<void> {
           autopilot.stopDaemon();
           finish();
         };
+        process.on('SIGHUP', reload);
         process.once('SIGINT', stop);
         process.once('SIGTERM', stop);
         try {
           await stopped;
           await autopilot.waitForIdle();
         } finally {
+          process.off('SIGHUP', reload);
           process.off('SIGINT', stop);
           process.off('SIGTERM', stop);
         }
@@ -382,31 +465,32 @@ async function main(args: string[]): Promise<void> {
 
   const port = integerOption(values.port ?? '3000', 'port', 65535);
   const pollMs = integerOption(values['poll-ms'] ?? '0', 'poll-ms', 2_147_483_647);
-  const runtime = createSystemRuntime({ dbPath: values.db, mode: mode ?? 'hitl', useMock: values.mock, envFileLoaded });
+  const runtime = createSystemRuntime({ dbPath: values.db, mode, useMock: values.mock, envFileLoaded });
   const autopilot = new AutopilotEngine(runtime);
   const mcpServer = new ArbitrageMcpServer({ runtime, autopilot });
-  const server = createArbitrageServer({ ...runtime, autopilot, mcpHandler: mcpServer.createHttpHandler() });
+  const server = createArbitrageServer({ ...runtime, runtime, autopilot, mcpHandler: mcpServer.createHttpHandler() });
 
   try {
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject);
-      server.listen(port, '127.0.0.1', () => {
+      server.listen(port, values.host ?? process.env.ARBITRAGE_HTTP_HOST ?? '127.0.0.1', () => {
         server.off('error', reject);
         resolve();
       });
     });
     const address = server.address();
     console.log(`Pokémon Arbitrage dashboard at http://127.0.0.1:${typeof address === 'object' ? address?.port : port}`);
-    if (pollMs > 0) runtime.pipeline.startLoop(pollMs);
+    const poller = runtime.pipeline;
+    if (pollMs > 0) poller.startLoop(pollMs, () => runtime.pipeline.runCycle());
     const shutdown = () => {
-      runtime.pipeline.stopLoop();
+      poller.stopLoop();
       server.close();
     };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
     try {
       await new Promise<void>(resolve => { server.once('close', resolve); });
-      await Promise.all([runtime.pipeline.waitForIdle(), autopilot.waitForIdle()]);
+      await Promise.all([poller.waitForIdle(), runtime.pipeline.waitForIdle(), autopilot.waitForIdle()]);
     } finally {
       process.off('SIGINT', shutdown);
       process.off('SIGTERM', shutdown);
@@ -421,7 +505,7 @@ if (isMainModule) {
   try {
     await main(process.argv.slice(2));
   } catch (error) {
-    console.error(error instanceof Error ? error.message : error);
+    console.error(redactSecrets(error instanceof Error ? error.message : String(error)));
     process.exitCode = 1;
   }
 }

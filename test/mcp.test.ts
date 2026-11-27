@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -18,6 +18,7 @@ import type {
   McpResourceContent, McpResourceDefinition, McpToolCallResult, McpToolDefinition,
 } from '../src/mcp/protocol.ts';
 import { createArbitrageServer } from '../src/server/httpServer.ts';
+import { ALLOWED_ENV_KEYS, SECRET_ENV_KEYS } from '../src/setup/configManager.ts';
 
 const request = (id: number | string, method: string, params?: unknown) => ({ jsonrpc: '2.0', id, method, params });
 const notification = { jsonrpc: '2.0', method: 'notifications/initialized' };
@@ -33,10 +34,12 @@ const toolNames = [
   'record_inventory_sale', 'list_audit_events',
   'get_buy_book', 'get_alpha_telemetry', 'ingest_webhook_listing', 'run_autonomous_triage', 'run_repricing_cycle',
   'import_sold_comps', 'sync_market_data', 'check_readiness', 'bootstrap_catalog', 'run_autopilot_pass',
+  'get_setup_guide', 'configure_settings', 'start_ebay_oauth', 'complete_ebay_oauth', 'discover_ebay_policies',
+  'test_provider_connection', 'reconcile_ebay_sales', 'expand_catalog',
 ];
-const resourceUris = ['state', 'hitl-queue', 'catalog', 'inventory', 'decisions/recent', 'audit/recent', 'buy-book', 'telemetry', 'readiness']
+const resourceUris = ['state', 'hitl-queue', 'catalog', 'inventory', 'decisions/recent', 'audit/recent', 'buy-book', 'telemetry', 'readiness', 'setup-guide']
   .map(path => 'pokemon-arbitrage://' + path);
-const promptNames = ['review_hitl_queue', 'daily_arbitrage_briefing', 'incident_triage', 'autopilot_optimization', 'autonomous_buyer'];
+const promptNames = ['review_hitl_queue', 'daily_arbitrage_briefing', 'incident_triage', 'autopilot_optimization', 'autonomous_buyer', 'guided_setup_wizard'];
 
 function setup(t: TestContext, options: SystemRuntimeOptions = {}) {
   const runtime = createSystemRuntime({
@@ -107,7 +110,7 @@ test('MCP negotiates protocol versions and handles lifecycle messages and JSON-R
   assertRpcError(batch[2], codes.METHOD_NOT_FOUND);
 });
 
-test('MCP exposes exactly 28 validated tools, 9 resources, and 5 prompts', async t => {
+test('MCP exposes exactly 36 validated tools, 10 resources, and 6 prompts', async t => {
   const { send, server } = setup(t);
   const { tools } = result<{ tools: McpToolDefinition[] }>(await send('tools/list'));
   assert.deepEqual(tools.map(tool => tool.name), toolNames);
@@ -142,6 +145,11 @@ test('MCP exposes exactly 28 validated tools, 9 resources, and 5 prompts', async
     toolCall(2, 'run_autopilot_pass', { tier: 'other' }),
     toolCall(2, 'run_autopilot_pass', { syncFirst: 1 }),
     toolCall(2, 'run_autopilot_pass', { syncLimit: 0 }),
+    toolCall(2, 'configure_settings', { settings: { EBAY_CLIENT_ID: {} } }),
+    toolCall(2, 'discover_ebay_policies', { createDefaultLocation: { locationKey: 'warehouse' } }),
+    toolCall(2, 'test_provider_connection', { provider: 'bad' }),
+    toolCall(2, 'expand_catalog', { pack: 'constructor' }),
+    toolCall(2, 'reconcile_ebay_sales', { limit: 201 }),
     toolCall(2, 'unknown'), request(2, 'tools/call', []), request(2, 'resources/read', { uri: 'invalid' }),
     request(2, 'prompts/get', { name: 'review_hitl_queue', arguments: { focusOrderId: false } }),
   ];
@@ -368,6 +376,7 @@ test('MCP reads all resources and renders all prompts from current data', async 
     ['incident_triage', undefined, ['killSwitchEngaged', 'mcp.kill_switch_updated', 'Payment declined']],
     ['autopilot_optimization', undefined, ['buyBook', 'detectToDecision', 'autopilotConfig']],
     ['autonomous_buyer', undefined, ['check_readiness', 'sync_market_data', 'run_autopilot_pass', 'Incident under review']],
+    ['guided_setup_wizard', undefined, ['nextSetupStep', 'complete_ebay_oauth', 'setupProgressPct']],
   ] as const) {
     const { messages } = result<{ messages: McpPromptMessage[] }>(await send('prompts/get', { name, arguments: args }));
     assert.equal(messages.length, 1);
@@ -433,15 +442,24 @@ test('spawned MCP stdio CLI flushes every JSON-RPC response at EOF with clean st
     toolCall(5, 'ingest_webhook_listing', { ...cleanListing, listingId: 'stdio-push' }),
     toolCall(6, 'get_alpha_telemetry'), toolCall(7, 'check_readiness'),
     toolCall(8, 'import_sold_comps', { csv: 'skuId,source,soldPriceUsd,soldAt\nsealed-ssp-bb,ebay,172.35,2026-11-26T11:00:00Z' }),
+    toolCall(9, 'configure_settings', { settings: { BESTBUY_API_KEY: 'stdio-private-credential' } }),
+    toolCall(10, 'get_setup_guide'), request(11, 'resources/read', { uri: 'pokemon-arbitrage://setup-guide' }),
+    request(12, 'prompts/get', { name: 'guided_setup_wizard' }),
   ];
   child.stdin.end('\n{bad json}\n' + messages.map(message => JSON.stringify(message)).join('\n') + '\n');
   assert.deepEqual(await closed, [0, null], stderr);
   assert.ok(stdout.endsWith('\n'));
   const responses = stdout.slice(0, -1).split('\n').map(line => JSON.parse(line) as JsonRpcResponse);
-  assert.deepEqual(responses.map(response => response.id), [null, 1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.deepEqual(responses.map(response => response.id), [null, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
   assertRpcError(responses[0], codes.PARSE_ERROR);
+  assert.ok(!stdout.includes('stdio-private-credential'));
+  assert.ok(!stderr.includes('stdio-private-credential'));
+  assert.equal(result<McpToolCallResult>(responses[9]).isError, undefined);
+  assert.equal(result<McpToolCallResult>(responses[10]).isError, undefined);
+  assert.equal(result<{ contents: McpResourceContent[] }>(responses[11]).contents.length, 1);
+  assert.equal(result<{ messages: McpPromptMessage[] }>(responses[12]).messages.length, 1);
   assert.equal(result<McpInitializeResult>(responses[1]).protocolVersion, '2025-03-26');
-  assert.equal(result<{ tools: McpToolDefinition[] }>(responses[2]).tools.length, 28);
+  assert.equal(result<{ tools: McpToolDefinition[] }>(responses[2]).tools.length, 36);
   const scan = result<McpToolCallResult>(responses[3]);
   assert.equal(scan.isError, undefined);
   assert.equal((scan.structuredContent?.summary as { fetchedCount: number }).fetchedCount, 17);
@@ -525,5 +543,116 @@ test('HTTP POST /mcp accepts requests, notifications, and batches on a loopback 
     assert.equal(runtime.db.getSystemState().killSwitchEngaged, false);
   } finally {
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+test('MCP completes guided setup, applies settings to existing handlers, and redacts every configured secret', async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'arbitrage-mcp-onboarding-'));
+  const envPath = join(cwd, '.env');
+  const keys = [...ALLOWED_ENV_KEYS, 'ARBITRAGE_SKIP_DOTENV'];
+  const previous = new Map(keys.map(key => [key, process.env[key]]));
+  for (const key of keys) delete process.env[key];
+  t.after(() => {
+    rmSync(cwd, { recursive: true, force: true });
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+  const { runtime } = setup(t, { seedCatalog: false });
+  const db = runtime.db;
+  const pipeline = runtime.pipeline;
+  const server = new ArbitrageMcpServer({ runtime, envPath });
+  const responses: unknown[] = [];
+  async function send(method: string, params?: object) {
+    const response = await server.handleMessage(request(1, method, params));
+    responses.push(response);
+    return response;
+  }
+  async function tool(name: string, args?: object) {
+    const outcome = result<McpToolCallResult>(await send('tools/call', { name, arguments: args }));
+    assert.equal(outcome.isError, undefined, outcome.content[0].text);
+    assert.deepEqual(JSON.parse(outcome.content[0].text), JSON.parse(JSON.stringify(outcome.structuredContent)));
+    return outcome.structuredContent!;
+  }
+  const initial = await tool('get_setup_guide');
+  assert.equal(initial.nextSetupStep, 'catalog');
+  assert.equal(initial.envPath, envPath);
+
+  const secrets = Object.fromEntries([...SECRET_ENV_KEYS].map(key => [key, `fixture-secret-value-${key.toLowerCase()}`]));
+  secrets.ARBITRAGE_WEBHOOK_URL = 'https://hooks.example.test/private-fixture-value';
+  const configured = await tool('configure_settings', {
+    settings: { ...secrets, EBAY_CLIENT_ID: 'example-client-id', EBAY_RU_NAME: 'registered-ru', ARBITRAGE_CASH_BALANCE_CENTS: '93456' },
+  });
+  assert.equal(runtime.db, db);
+  assert.notEqual(runtime.pipeline, pipeline);
+  assert.equal(runtime.config.cashBalanceCents, 93456);
+  assert.equal(statSync(envPath).mode & 0o777, 0o600);
+  assert.equal((configured.maskedValues as Record<string, string>).EBAY_CLIENT_SECRET, '[redacted]');
+  await tool('configure_settings', { settings: { ARBITRAGE_CASH_BALANCE_CENTS: '120000' }, reloadRuntime: false });
+  assert.equal(runtime.config.cashBalanceCents, 93456);
+
+  const consent = await tool('start_ebay_oauth', { sandbox: true, includeBuyOrder: true, state: 'operator-state' });
+  assert.equal(new URL(String(consent.url)).hostname, 'auth.sandbox.ebay.com');
+  assert.equal(new URL(String(consent.url)).searchParams.get('redirect_uri'), 'registered-ru');
+  const issuedAccess = 'issued-fixture-access-token';
+  const issuedRefresh = 'issued-fixture-refresh-token';
+  const used: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input));
+    used.push(url.pathname);
+    if (url.pathname.endsWith('/token')) {
+      const grant = new URLSearchParams(String(init?.body));
+      if (grant.get('grant_type') === 'authorization_code') {
+        assert.equal(grant.get('code'), 'encoded+code');
+        return Response.json({ access_token: issuedAccess, refresh_token: issuedRefresh, expires_in: 7200, refresh_token_expires_in: 86400 });
+      }
+      assert.equal(grant.get('refresh_token'), issuedRefresh);
+      return Response.json({ access_token: issuedAccess, expires_in: 7200 });
+    }
+    if (url.pathname.endsWith('/location/warehouse')) return new Response(null, { status: 204 });
+    if (url.pathname.endsWith('/location')) return Response.json({ locations: [
+      { merchantLocationKey: 'warehouse', merchantLocationStatus: 'ENABLED', privateEcho: issuedAccess },
+    ] });
+    if (url.pathname.endsWith('/fulfillment_policy')) return Response.json({ fulfillmentPolicies: [{ fulfillmentPolicyId: 'ship' }] });
+    if (url.pathname.endsWith('/payment_policy')) return Response.json({ paymentPolicies: [{ paymentPolicyId: 'pay' }] });
+    if (url.pathname.endsWith('/return_policy')) return Response.json({ returnPolicies: [{ returnPolicyId: 'return' }] });
+    if (url.pathname.endsWith('/cards')) return Response.json({ data: [] });
+    assert.fail('Unexpected mock endpoint ' + url.pathname);
+  });
+  const exchange = await tool('complete_ebay_oauth', {
+    sandbox: true, code: 'https://return.example.test/?code=encoded%2Bcode', saveAs: 'both',
+  });
+  assert.deepEqual(exchange.updatedKeys, ['EBAY_REFRESH_TOKEN', 'EBAY_SELL_REFRESH_TOKEN']);
+  assert.equal(runtime.config.cashBalanceCents, 120000);
+  const discovered = await tool('discover_ebay_policies', {
+    sandbox: true, autoSave: true, createDefaultLocation: {
+      locationKey: 'warehouse', address: { city: 'State College', stateOrProvince: 'PA', postalCode: '16801', country: 'US' },
+    },
+  });
+  assert.equal(discovered.merchantLocationKey, 'warehouse');
+  assert.equal(discovered.paymentPolicyId, 'pay');
+  assert.match(readFileSync(envPath, 'utf8'), /EBAY_MERCHANT_LOCATION_KEY=warehouse/);
+  assert.ok(used.includes('/sell/inventory/v1/location/warehouse'));
+  assert.equal((await tool('test_provider_connection', { provider: 'pokemon_tcg' })).ok, true);
+  const expanded = await tool('expand_catalog', { syncAfter: true, syncLimit: 1 });
+  assert.equal(expanded.totalCatalogSkus, 95);
+  assert.ok(expanded.sync);
+  const reconciled = await tool('reconcile_ebay_sales', { limit: 1 });
+  assert.equal(reconciled.enabled, true);
+  assert.equal(reconciled.cashBalanceCents, 120000);
+
+  const canary = [...Object.values(secrets), issuedAccess, issuedRefresh].join(' ');
+  await tool('set_kill_switch', { engaged: true, reason: canary });
+  await send('resources/read', { uri: 'pokemon-arbitrage://setup-guide' });
+  await send('prompts/get', { name: 'guided_setup_wizard' });
+  await tool('list_audit_events');
+  const audits = db.listAuditEvents();
+  const configurationAudit = audits.find(event => event.eventType === 'mcp.settings_configured');
+  assert.ok(configurationAudit);
+  assert.deepEqual(Object.keys(configurationAudit.payload).sort(), ['removedKeys', 'updatedKeys']);
+  for (const secret of canary.split(' ')) {
+    assert.ok(!JSON.stringify(responses).includes(secret), 'MCP must redact all current and rotated credentials');
+    assert.ok(!JSON.stringify(audits).includes(secret), 'Audit persistence must redact credentials');
   }
 });

@@ -1,4 +1,5 @@
 import type { SystemRuntime } from '../cli.ts';
+import { setupSteps } from '../setup/setupSteps.ts';
 import type { OperatingMode } from '../domain/types.ts';
 import type { AutopilotEngine } from './autopilot.ts';
 import { EbaySellInventoryAdapter, SimulatedSellerAdapter } from '../liquidation/ebaySellerAdapter.ts';
@@ -13,6 +14,10 @@ export interface ReadinessReport {
   killSwitchEngaged: boolean;
   killSwitchReason?: string;
   envFileLoaded: boolean;
+  fulfillmentSyncEnabled: boolean;
+  dynamicCashBalanceCents: number;
+  setupProgressPct: number;
+  nextSetupStep: string | null;
   catalogSkuCount: number;
   freshCompSkuCount: number;
   staleCompSkuCount: number;
@@ -35,7 +40,7 @@ export interface ReadinessReport {
 }
 
 type ReadinessRuntime = Pick<SystemRuntime, 'db' | 'config' | 'fmvEngine' | 'envFileLoaded' | 'useMock'>
-  & Partial<Pick<SystemRuntime, 'connectors' | 'marketSync' | 'inventoryManager'>>;
+  & Partial<Pick<SystemRuntime, 'connectors' | 'marketSync' | 'inventoryManager' | 'salesReconciler' | 'envPath'>>;
 
 function splitByEnabled(sources: readonly { name: string; isEnabled(): boolean }[]) {
   const enabled: string[] = [];
@@ -84,7 +89,7 @@ export function evaluateReadiness(
 
   if (!envFileLoaded && !useMock) {
     warnings.push('No .env file was loaded. Settings can also come from the launch environment.');
-    recommendedNextActions.push('Use .env.example to configure any missing settings, then restart the CLI or MCP server.');
+    recommendedNextActions.push('Use configure_settings or .env.example to set up authorized providers.');
   }
   if (killSwitchEngaged) {
     blockingIssues.push('The kill switch is engaged.');
@@ -130,10 +135,14 @@ export function evaluateReadiness(
     recommendedNextActions.push('Review a shadow pass and confirm operator approval before switching to live.');
   }
 
-  return {
+  const report: Omit<ReadinessReport, 'setupProgressPct' | 'nextSetupStep'> = {
+    fulfillmentSyncEnabled: runtime.salesReconciler?.isConfigured() ?? false,
+    dynamicCashBalanceCents: db.getPortfolioSnapshot(config, nowIso).cashBalanceCents,
     nodeVersion: process.version, dbPath: config.dbPath, operatingMode, killSwitchEngaged, killSwitchReason,
     envFileLoaded, catalogSkuCount, freshCompSkuCount, staleCompSkuCount, enabledConnectors, disabledConnectors,
     enabledSyncers, disabledSyncers, checkoutCapability, sellCapability, certVerifier, visionVerifier, webhookAlertingEnabled,
     readyForShadowScan, readyForHitlAlerts, readyForLiveAutoBuy, readyForLiveAutoSell, blockingIssues, warnings, recommendedNextActions,
   };
+  const { setupProgressPct, nextSetupStep } = setupSteps(report, db.listOrders('shadow_recorded', 1).length > 0);
+  return { ...report, setupProgressPct, nextSetupStep };
 }

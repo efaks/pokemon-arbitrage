@@ -102,6 +102,57 @@ interface EbaySellerOptions {
 const marketplaceId = 'EBAY_US';
 const graderIds: Record<Grader, string> = { PSA: '275010', BGS: '275013', CGC: '275015', SGC: '275016' };
 const rawConditionIds = { NM: '400010', LP: '400015', MP: '400016', HP: '400017', DMG: '400017' };
+const languageNames = { EN: 'English', JP: 'Japanese', KR: 'Korean', CN: 'Chinese' };
+const holoVariants = new Set(['holo', 'sir', 'alt_art', 'first_edition', 'shadowless']);
+const cardFeatures: Partial<Record<CanonicalSku['variant'], string>> = {
+  sir: 'Special Illustration Rare', alt_art: 'Alternative Art', promo: 'Promo',
+  first_edition: '1st Edition', shadowless: 'Shadowless', staff_stamp: 'Staff Stamp',
+};
+
+function cardName(sku: CanonicalSku): string {
+  const trailingParentheticals = /(?:\s*\([^()]*\))+\s*$/;
+  let name = sku.name.split(/\s+[-–—]\s+/)[0].replace(trailingParentheticals, '').trim();
+  if (name.toLowerCase().endsWith(' ' + sku.setName.toLowerCase())) {
+    name = name.slice(0, -(sku.setName.length + 1));
+  }
+  if (sku.cardNumber) {
+    const number = sku.cardNumber.replace(/[.*+?^$(){}|[\]\\]/g, '\\$&');
+    const shortNumber = number.split('/')[0];
+    name = name.replace(new RegExp('\\s+(?:#\\s*)?(?:' + number + '|' + shortNumber + ')(?=\\s|$).*', 'i'), '');
+  }
+  name = name.replace(/\s+#?\s*[a-z]{0,4}\d+\s*\/\s*[a-z]{0,4}\d+(?=\s|$).*/i, '');
+  return name.replace(trailingParentheticals, '').trim();
+}
+
+function productAspects(sku: CanonicalSku, item: InventoryItem): Record<string, string[]> {
+  const aspects: Record<string, string[]> = {
+    Game: ['Pokémon TCG'], Set: [sku.setName], Language: [languageNames[sku.language]],
+  };
+  if (sku.assetClass === 'sealed') {
+    const configuration = /\bdeck\b/i.test(sku.name) ? 'Deck'
+      : /\bpack\b/i.test(sku.name) && !/\b(box|bundle|collection|display)\b/i.test(sku.name) ? 'Pack' : 'Box';
+    aspects.Configuration = [configuration];
+    aspects.Features = ['Factory Sealed'];
+    if (sku.upc) aspects.UPC = [sku.upc];
+    return aspects;
+  }
+
+  aspects['Card Name'] = [cardName(sku)];
+  if (sku.cardNumber) aspects['Card Number'] = [sku.cardNumber];
+  aspects.Finish = [sku.variant === 'reverse_holo' ? 'Reverse Holo' : holoVariants.has(sku.variant) ? 'Holo' : 'Regular'];
+  const feature = cardFeatures[sku.variant];
+  if (feature) aspects.Features = [feature];
+  aspects.Graded = [sku.assetClass === 'graded' ? 'Yes' : 'No'];
+  if (sku.assetClass === 'graded') {
+    aspects['Professional Grader'] = [item.grader ?? sku.grader!];
+    aspects.Grade = [item.grade ?? sku.grade!];
+  }
+  return aspects;
+}
+
+function isHttpsPhoto(url: string): boolean {
+  return url.startsWith('https://') && URL.canParse(url);
+}
 
 // eBay category 183454 uses descriptors for both graded and ungraded singles.
 function conditionFields(sku: CanonicalSku, item: InventoryItem, observed: CardCondition) {
@@ -204,12 +255,21 @@ export class EbaySellInventoryAdapter implements SellListingAdapter {
   }
 
   async publishListing(item: InventoryItem, sku: CanonicalSku, input: PublishListingInput): Promise<PublishListingResult> {
+    const imageUrls = input.imageUrls?.filter(isHttpsPhoto) ?? [];
+    if (!imageUrls.length && sku.referenceImageUrl && isHttpsPhoto(sku.referenceImageUrl)) {
+      imageUrls.push(sku.referenceImageUrl);
+    }
+    if (!imageUrls.length) {
+      return {
+        success: false,
+        failureReason: 'eBay publishing requires at least one HTTPS photo URL; pass imageUrls or set referenceImageUrl on the SKU',
+      };
+    }
     let operation = 'inventory item upsert';
     let externalOfferId: string | undefined;
     try {
       const key = inventorySkuKey(item);
       const description = input.description?.trim() || item.skuName;
-      const imageUrls = input.imageUrls?.length ? input.imageUrls : sku.referenceImageUrl ? [sku.referenceImageUrl] : [];
       const condition = input.condition ?? item.actualCondition ?? item.expectedCondition;
       const offer = {
         sku: key, listingDescription: description, marketplaceId, format: 'FIXED_PRICE', listingDuration: 'GTC',
@@ -223,7 +283,7 @@ export class EbaySellInventoryAdapter implements SellListingAdapter {
         availability: { shipToLocationAvailability: { quantity: 1 } },
         product: {
           title: (input.title?.trim() || item.skuName).slice(0, 80), description, imageUrls,
-          aspects: { Game: ['Pokémon TCG'], Set: [sku.setName] },
+          aspects: productAspects(sku, item),
         },
       });
 

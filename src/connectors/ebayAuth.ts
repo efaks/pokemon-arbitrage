@@ -1,3 +1,4 @@
+import { rememberSecret } from '../setup/secrets.ts';
 import { fetchWithBackoff, HttpResponseError } from './base.ts';
 import type { FetchLike } from './base.ts';
 
@@ -55,6 +56,7 @@ export class EbayOAuthTokenManager implements EbayTokenProvider {
   async getAccessToken(): Promise<string> {
     if (!this.clientId || !this.clientSecret) {
       if (!this.staticToken) throw new Error('eBay OAuth credentials are missing');
+      rememberSecret(this.staticToken);
       return this.staticToken;
     }
     if (this.accessToken && this.now() + this.refreshBufferMs < this.expiresAtMs) return this.accessToken;
@@ -91,6 +93,7 @@ export class EbayOAuthTokenManager implements EbayTokenProvider {
       throw new Error('eBay OAuth returned an invalid token or expiry');
     }
     this.accessToken = data.access_token.trim();
+    rememberSecret(this.accessToken);
     this.expiresAtMs = this.now() + data.expires_in * 1000;
     return this.accessToken;
   }

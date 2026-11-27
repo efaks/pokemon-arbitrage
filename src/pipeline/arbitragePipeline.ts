@@ -1,3 +1,4 @@
+import { redactSecrets } from '../setup/secrets.ts';
 import { randomUUID } from 'node:crypto';
 import type { ArbitrageConfig } from '../config.ts';
 import type { SupplyConnector } from '../connectors/base.ts';
@@ -183,7 +184,9 @@ export class ArbitragePipeline {
     return summary;
   }
 
-  startLoop(intervalMs: number): void {
+  private activePoll?: Promise<CycleSummary>;
+
+  startLoop(intervalMs: number, runCycle = () => this.runCycle()): void {
     if (!Number.isSafeInteger(intervalMs) || intervalMs < 1 || intervalMs > 2_147_483_647) {
       throw new RangeError('Scan interval must be between 1 and 2147483647 milliseconds');
     }
@@ -195,10 +198,12 @@ export class ArbitragePipeline {
     };
     const tick = async () => {
       try {
-        await this.runCycle();
+        this.activePoll = runCycle();
+        await this.activePoll;
       } catch (error) {
-        console.error('Scheduled scan failed', error);
+        console.error('Scheduled scan failed', redactSecrets(error instanceof Error ? error.message : String(error)));
       } finally {
+        this.activePoll = undefined;
         schedule();
       }
     };
@@ -211,7 +216,7 @@ export class ArbitragePipeline {
   }
 
   async waitForIdle(): Promise<void> {
-    await this.activeCycle;
+    await Promise.allSettled([this.activeCycle, this.activePoll]);
   }
 
   async approveHitlOrder(orderId: string, options: { confirmAnomaly?: boolean } = {}): Promise<ExecutionOutcome> {

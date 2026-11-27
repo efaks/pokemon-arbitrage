@@ -1,3 +1,4 @@
+import { redactSecrets } from '../setup/secrets.ts';
 import type { FetchLike } from '../connectors/base.ts';
 import { formatUsd } from '../domain/money.ts';
 import type { ArbitrageDecision, PurchaseOrder } from '../domain/types.ts';
@@ -37,15 +38,15 @@ export class NullNotifier implements AlertNotifier {
 
 export class ConsoleNotifier implements AlertNotifier {
   notifyDecision(decision: ArbitrageDecision): void {
-    console.info(decisionMessage(decision));
+    console.info(redactSecrets(decisionMessage(decision)));
   }
 
   notifyOrder(order: PurchaseOrder, event: string): void {
-    console.info(orderMessage(order, event));
+    console.info(redactSecrets(orderMessage(order, event)));
   }
 
   notifyCircuitBreaker(reason: string): void {
-    console.warn(`Circuit breaker engaged\n${reason}`);
+    console.warn(`Circuit breaker engaged\n${redactSecrets(reason)}`);
   }
 }
 
@@ -94,10 +95,11 @@ export class WebhookNotifier implements AlertNotifier {
     return this.send(`Circuit breaker engaged\n${reason}`);
   }
 
-  private async send(message: string): Promise<void> {
+  private async send(rawMessage: string): Promise<void> {
     if (!this.webhookUrl) return;
     try {
       const url = new URL(this.webhookUrl);
+      const message = redactSecrets(rawMessage);
       const slack = { text: message.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
         unfurl_links: false, unfurl_media: false };
       const discord = { content: message.slice(0, 2000), allowed_mentions: { parse: [] } };

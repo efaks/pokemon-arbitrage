@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { SQLInputValue, SQLOutputValue } from 'node:sqlite';
+import { redactSecrets } from '../setup/secrets.ts';
 import type { ArbitrageConfig } from '../config.ts';
 import type {
   ArbitrageDecision,
@@ -436,6 +437,11 @@ export class ArbitrageDatabase {
     }
   }
 
+  /** Runs synchronous writes under one SQLite write lock. */
+  withWriteTransaction<T>(operation: () => T): T {
+    return this.transaction('BEGIN IMMEDIATE', operation);
+  }
+
   upsertSku(sku: CanonicalSku): void {
     this.db.prepare(`
       INSERT INTO canonical_skus (
@@ -655,10 +661,19 @@ export class ArbitrageDatabase {
     return this.transaction('BEGIN', () => this.readPortfolioSnapshot(config, nowIso));
   }
 
-  /** Spending resets at midnight UTC. The cash balance is supplied by configuration. */
+  /** Daily spend resets at midnight UTC. Available cash includes all commitments and sales. */
   private readPortfolioSnapshot(config: ArbitrageConfig, nowIso: string): PortfolioSnapshot {
     const dayStart = `${new Date(nowIso).toISOString().slice(0, 10)}T00:00:00.000Z`;
     const dailySpendCents = this.getDailySpendCents(dayStart);
+    const cashLedger = this.db.prepare(`
+      SELECT
+        (SELECT COALESCE(SUM(landed_cost_cents), 0)
+          FROM orders WHERE status IN ${SPEND_ORDER_STATUSES}) AS committed,
+        (SELECT COALESCE(SUM(sold_price_cents - COALESCE(exit_fees_cents, 0)), 0)
+          FROM inventory_items WHERE status = 'sold') AS proceeds
+    `).get();
+    const totalCommittedSpendCents = cashLedger?.committed as number;
+    const totalRealizedProceedsCents = cashLedger?.proceeds as number;
     const positions = this.db.prepare(`
       SELECT sku_id, SUM(units) AS units FROM (
         SELECT sku_id, quantity AS units FROM orders WHERE status IN ${OPEN_ORDER_STATUSES}
@@ -673,7 +688,7 @@ export class ArbitrageDatabase {
     return {
       dailySpendCents,
       dailySpendCapCents: config.dailySpendCapCents,
-      cashBalanceCents: config.cashBalanceCents,
+      cashBalanceCents: Math.max(0, config.cashBalanceCents - totalCommittedSpendCents + totalRealizedProceedsCents),
       minCashReserveCents: config.minCashReserveCents,
       skuPositions: Object.fromEntries(positions.map(row => [row.sku_id as string, row.units as number])),
       activeInventoryCostCents: activeInventory?.cost as number,
@@ -747,7 +762,7 @@ export class ArbitrageDatabase {
   }
 
   logAuditEvent(eventType: string, payload: Record<string, unknown> = {}): AuditEvent {
-    const event = { id: randomUUID(), eventType, payload, createdAt: new Date().toISOString() };
+    const event = { id: randomUUID(), eventType: redactSecrets(eventType), payload: redactSecrets(payload), createdAt: new Date().toISOString() };
     this.db.prepare('INSERT INTO audit_events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)')
       .run(event.id, event.eventType, JSON.stringify(event.payload), event.createdAt);
     return event;

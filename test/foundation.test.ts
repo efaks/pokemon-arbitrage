@@ -265,7 +265,7 @@ test('daily spend includes committed orders and positions count open order units
   const config = createConfig({ dailySpendCapCents: 20000, cashBalanceCents: 60000, minCashReserveCents: 5000 });
   const portfolio = db.getPortfolioSnapshot(config, NOW);
   assert.deepEqual(portfolio, {
-    dailySpendCents: 12000, dailySpendCapCents: 20000, cashBalanceCents: 60000,
+    dailySpendCents: 12000, dailySpendCapCents: 20000, cashBalanceCents: 45000,
     minCashReserveCents: 5000, skuPositions: { [SKU_ID]: 4 },
     activeInventoryCostCents: 3000, activeInventoryCount: 1,
   });
@@ -274,6 +274,20 @@ test('daily spend includes committed orders and positions count open order units
     shadowOrdersCount: 1, totalPredictedProfitCents: 2100, totalRealizedProfitCents: 520,
     soldCount: 1, recentDecisionsCount: 9,
   });
+});
+
+test('cash balance recycles net proceeds when inventory is marked sold', t => {
+  const db = seedDb(t);
+  const config = createConfig({ cashBalanceCents: 10000 });
+  const acquired = order(db, 'cash-ledger-sale', 'filled', 1, YESTERDAY);
+  db.createOrderIdempotent(acquired);
+  const item = { ...inventory('resale', acquired.id, 'listed'), listedPriceCents: 5500 };
+  db.createInventoryItem(item);
+  assert.equal(db.getPortfolioSnapshot(config, NOW).cashBalanceCents, 7000);
+
+  db.updateInventoryItem(item.id, { status: 'sold', soldPriceCents: 5200, exitFeesCents: 640, soldAt: NOW });
+  assert.equal(db.getPortfolioSnapshot(config, NOW).cashBalanceCents, 11560);
+  assert.equal(db.getPortfolioSnapshot(config, NOW).dailySpendCents, 0);
 });
 
 test('decision and inventory reads preserve JSON details and optional fields', t => {

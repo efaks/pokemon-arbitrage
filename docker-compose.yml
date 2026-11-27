@@ -1,0 +1,20 @@
+services:
+  dashboard:
+    build: .
+    env_file: .env
+    command: ["node", "src/cli.ts", "serve", "--port", "3000", "--db", "/app/data/arbitrage.sqlite"]
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  autopilot:
+    build: .
+    env_file: .env
+    command: ["node", "src/cli.ts", "autopilot", "--db", "/app/data/arbitrage.sqlite", "--sync-ms", "3600000"]
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      disable: true
+    restart: unless-stopped

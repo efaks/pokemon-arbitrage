@@ -376,7 +376,9 @@ export class ExecutionCoordinator {
     if ((portfolio.skuPositions[order.skuId] ?? 0) + incrementalUnits > this.config.maxPositionPerSku) {
       return 'Per-SKU max position limit reached';
     }
-    if (portfolio.cashBalanceCents - order.landedCostCents < portfolio.minCashReserveCents) {
+    const existingReserved = reserved ? (this.db.getOrder(order.id)?.landedCostCents ?? order.landedCostCents) : 0;
+    const incrementalCash = Math.max(0, order.landedCostCents - existingReserved);
+    if (portfolio.cashBalanceCents - incrementalCash < portfolio.minCashReserveCents) {
       return 'Cash reserve floor breached';
     }
     return undefined;

@@ -1,0 +1,17 @@
+[Unit]
+Description=Pokémon Arbitrage Autopilot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pokemon-arbitrage
+WorkingDirectory=/opt/pokemon-arbitrage
+ExecStart=/usr/bin/node src/cli.ts autopilot --db data/arbitrage.sqlite --sync-ms 3600000
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -47,7 +47,7 @@ Run commands from the repository root with Node.js 26. Install the development d
 | `node src/cli.ts mcp --mock --db :memory: --mode hitl` | Start a simulated MCP server over stdio. |
 | `npm run typecheck` / `npm test` | Check TypeScript and run the test files. |
 
-The default database path is `data/arbitrage.sqlite`. `serve` defaults to HITL and disables polling. `scan`, `mcp`, and `autopilot` use the persisted mode unless an explicit mode is configured. A new database starts in shadow mode. `--mock` seeds fixture SKUs and sales and uses simulated verification and checkout. Use an in-memory or separate database for fixture runs. Load real SKUs and comparable sales before running real feeds.
+The default database path is `data/arbitrage.sqlite`. `serve` disables polling by default. `serve`, `scan`, `mcp`, and `autopilot` use the persisted mode unless an explicit mode is configured. A new database starts in shadow mode. `--mock` seeds fixture SKUs and sales and uses simulated verification and checkout. Use an in-memory or separate database for fixture runs. Load real SKUs and comparable sales before running real feeds.
 
 ## Autonomous Competitive Engine
 
@@ -78,6 +78,9 @@ In live mode with the kill switch clear, asynchronous repricing pushes eligible 
 | `POST /api/comps/import` | Import historical sales with `comps`, `csv`, or both. |
 | `POST /api/inventory/:id/publish` | Publish a listing with optional `channel`, `listedPriceCents`, `title`, `description`, `imageUrls`, and `pushLive`. |
 | `POST /api/inventory/:id/withdraw` | Withdraw a listing with an optional `reason`. |
+| `GET /api/setup-guide` | Read the current setup checklist and readiness. |
+| `POST /api/catalog/expand` | Install a catalog `pack` (defaults to `all_curated`). |
+| `POST /api/inventory/reconcile-sales` | Record paid eBay sales. Accepts optional `sinceIso` and `limit` (1–200). |
 
 For example, push a fixture from the same host while running `serve --mock --mode shadow`.
 
@@ -91,7 +94,7 @@ Supply the source's stable `listingId`, actual seller profile, and checkout capa
 
 ## MCP integration
 
-The server negotiates `2025-03-26` and `2024-11-05`. It exposes 28 tools, 9 resources, and 5 prompts over both transports.
+The server negotiates `2025-03-26` and `2024-11-05`. It exposes 36 tools, 10 resources, and 6 prompts over both transports.
 
 **Stdio.** Launch `node src/cli.ts mcp` directly from a client. The process reads one JSON-RPC frame per line from stdin and writes only JSON-RPC frames to stdout. Use the Node command in client configuration to keep npm's script banner out of the stream.
 
@@ -143,7 +146,15 @@ Use `tools/list` for input schemas and `tools/call` with `params.name` and `para
 | `sync_market_data` | Import market data and refresh the Buy Book. Accepts an optional positive integer `limit`. |
 | `check_readiness` | Check operating mode, kill switch, comp freshness, feed configuration, and checkout capability. |
 | `bootstrap_catalog` | Upsert the starter SKUs and refresh the Buy Book. Set `includeDemoComps: true` only in a demo database. |
-| `run_autopilot_pass` | Scan, triage, and reprice. Accepts optional `tier` (`all`, `hot`, `standard`, or `cold`), `syncFirst`, and positive integer `syncLimit`. Returns the pass and optional sync summary. |
+| `run_autopilot_pass` | Scan, triage, reconcile sales, and reprice. Accepts optional `tier` (`all`, `hot`, `standard`, or `cold`), `syncFirst`, and positive integer `syncLimit`. Returns the pass and optional sync summary. |
+| `get_setup_guide` | Read the eight-step onboarding checklist and current progress. |
+| `configure_settings` | Store allowlisted `settings` in a private `.env` file. Use `null` to remove a key and `reloadRuntime: false` to defer applying changes. |
+| `start_ebay_oauth` | Build the operator consent URL using the registered RuName and selected scopes. |
+| `complete_ebay_oauth` | Exchange the code or pasted redirect URL and save the refresh token to the selected buy and/or sell settings. |
+| `discover_ebay_policies` | Read seller policies and locations. Optionally save defaults or create an approved warehouse. |
+| `test_provider_connection` | Probe eBay, market data, retail feeds, PSA, vision, and webhook connectivity. |
+| `reconcile_ebay_sales` | Record paid eBay sales and return current available cash in USD cents. |
+| `expand_catalog` | Install a curated catalog pack and optionally sync market data for a limited number of SKUs. |
 
 `run_scan_cycle` with `useMock: true` selects the fixture feed and seeds an empty catalog. The runtime's verifier and checkout adapter are selected at startup. Launch with `--mock` to simulate the whole workflow. `evaluate_listing` supplies a hypothetical trusted seller when seller data is omitted. Supply the actual seller profile when assessing seller trust.
 
@@ -162,6 +173,7 @@ Read these JSON snapshots with `resources/read`.
 | `pokemon-arbitrage://buy-book` | SKU buy thresholds, momentum, and polling tiers. |
 | `pokemon-arbitrage://telemetry` | Latency, alpha signal counts, and source execution outcomes. |
 | `pokemon-arbitrage://readiness` | Live readiness report with blockers, warnings, and next actions. |
+| `pokemon-arbitrage://setup-guide` | Interactive setup checklist, progress, and next step. |
 
 ### Prompts
 
@@ -174,6 +186,7 @@ Retrieve a prompt with `prompts/get`.
 | `incident_triage` | System state, kill switch status, recent audit events, and failed orders. |
 | `autopilot_optimization` | Buy Book tiers, alpha telemetry, settings, and system state. |
 | `autonomous_buyer` | Current readiness and the setup, shadow, and buying loop for Muse and MCP agents. |
+| `guided_setup_wizard` | Live checklist and an interactive onboarding playbook for Muse. |
 
 ## Costco Wholesale and Pokémon Center feeds
 
@@ -188,11 +201,12 @@ Both feeds accept optional `upc`, `description`, `imageUrl`, and `shippingCents`
 
 ## Environment variables
 
-The CLI loads `.env` from the working directory, including when launched over MCP stdio. Shell variables take precedence. Set `ARBITRAGE_SKIP_DOTENV=1` in the shell to skip loading, and restart the process after editing `.env`. Keep `.env` out of version control.
+The CLI loads `.env` from the working directory, including when launched over MCP stdio. Shell variables take precedence. Set `ARBITRAGE_SKIP_DOTENV=1` in the shell to skip loading. Explicit MCP settings changes apply to the running process by default. Keep `.env` at mode `0600` and out of version control.
 
 | Variable | Use |
 | --- | --- |
 | `EBAY_CLIENT_ID` | eBay OAuth client ID. Browse mints an application access token when both client credentials are set. |
+| `EBAY_RU_NAME` | Registered eBay OAuth redirect name used by the consent and code exchange tools. |
 | `EBAY_CLIENT_SECRET` | eBay OAuth client secret. OAuth tokens are cached in memory and refreshed near expiry. |
 | `EBAY_REFRESH_TOKEN` | Consented user refresh token for eBay member checkout. Requires both client credentials and approved Order API access. |
 | `EBAY_ACCESS_TOKEN` | Static Browse access token for use without OAuth client credentials. |
@@ -226,7 +240,7 @@ The CLI loads `.env` from the working directory, including when launched over MC
 | Setting | Default |
 | --- | --- |
 | `ARBITRAGE_DB_PATH` | `data/arbitrage.sqlite` |
-| `ARBITRAGE_MODE` | New databases start in `shadow`. `serve` defaults to `hitl`. |
+| `ARBITRAGE_MODE` | New databases start in `shadow`. Existing databases retain their mode when this setting is blank. |
 | `ARBITRAGE_AUTO_PUBLISH_LISTINGS` | Disabled. Set to `true` to enable automatic publication on the eBay route in live mode. |
 | `ARBITRAGE_MIN_PROFIT_CENTS` | `1500` |
 | `ARBITRAGE_MIN_NET_ROI` | `0.15` |
@@ -294,3 +308,23 @@ Check the returned `inserted`, `duplicatesSkipped`, and `rejected` counts. Fresh
 3. Run `npm run bootstrap` to seed the starter catalog. Configure the market data providers you use, run a small sync, and review its errors, catalog matches, prices, and Buy Book entries. Use `npm run doctor` to check comp freshness and setup blockers.
 4. Set the vision URL and key if you use live photo assessment. Configure your webhook and confirm it receives alerts during a pilot scan.
 5. Review spend caps, cash reserve, per-SKU limits, and the kill switch. Review real decisions in shadow and then in HITL before enabling live checkout. In HITL, the autopilot daemon can approve eligible orders under its autonomous policy.
+
+## Guided setup and deployment
+
+Run the setup checklist against the database you plan to use. Install a catalog pack and import or sync verified comparable sales. Use a separate database for simulation.
+
+```sh
+npm run --silent setup -- --db data/arbitrage.sqlite --json
+npm run --silent expand-catalog -- --pack all_curated --db data/arbitrage.sqlite
+npm run --silent reconcile-sales -- --mock --db :memory:
+```
+
+Open `guided_setup_wizard` in Muse to walk through the same checklist. Enter credentials privately. The MCP configuration tool preserves unrelated settings, masks secrets in results, and rebuilds the active runtime against the same SQLite connection. Use a dedicated `.env` and SQLite database for sandbox rehearsal. Match the eBay credential environment and `EBAY_SELL_SANDBOX`. Production checkout requires approved eBay Order API access. [eBay consent and token exchange](https://developer.ebay.com/develop/guides/sell/authorization)
+
+Call `discover_ebay_policies` before enabling `autoSave`. Review the shipping, payment, and return rules and verify the warehouse is enabled. Fulfillment reconciliation records each matching paid inventory sale once. Review the summary for skipped orders and provider errors. Call reconciliation with a date and a limit up to 200 if the default recent page needs narrowing. [eBay inventory locations](https://developer.ebay.com/api-docs/sell/static/inventory/managing-inventory-locations.html)
+
+Use one active polling daemon per database. The dashboard reuses the database mode and leaves polling off by default. Keep its unauthenticated HTTP interface on a trusted local endpoint.
+
+- **Docker Compose** Set up the host `.env`, create `./data` writable by the image's `node` user (UID 1000), and run `docker compose up -d --build`. Both services read the host `.env` at container creation and share `./data`. The dashboard is published on `127.0.0.1:3000`. Apply durable settings through the host file, then run `docker compose up -d --force-recreate`. MCP edits inside a dashboard container affect that process and its local file.
+- **Linux systemd** Edit the unit for the installation directory, service account, and absolute Node 26 path. Give the service account access to `.env` and the database directory. Install the unit in `/etc/systemd/system` and run `systemctl enable --now pokemon-arbitrage`. Use `systemctl reload pokemon-arbitrage` after editing the host file. [service unit](deploy/pokemon-arbitrage.service)
+- **macOS launchd** Edit the LaunchAgent for the checkout and absolute Node 26 path. Place it in `~/Library/LaunchAgents` and use `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pokemon-arbitrage.autopilot.plist`. Use `launchctl kill SIGHUP gui/$(id -u)/com.pokemon-arbitrage.autopilot` after editing the host file. [LaunchAgent plist](deploy/com.pokemon-arbitrage.autopilot.plist)

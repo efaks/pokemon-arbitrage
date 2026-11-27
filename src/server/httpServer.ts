@@ -2,6 +2,9 @@ import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { resolve } from 'node:path';
+import { installCatalogPack, listCatalogPacks } from '../catalog/catalogPacks.ts';
+import { buildSetupGuide } from '../setup/configManager.ts';
+import { redactSecrets } from '../setup/secrets.ts';
 import type { SystemRuntime } from '../cli.ts';
 import type { ArbitrageConfig } from '../config.ts';
 import type { ArbitrageDatabase } from '../db/database.ts';
@@ -22,7 +25,8 @@ export type McpHttpHandler = (
   payload: unknown, reqHeaders?: Record<string, string | string[] | undefined>,
 ) => Promise<{ status: number; body?: unknown; headers?: Record<string, string> }>;
 
-export interface ArbitrageServerOptions extends Partial<Pick<SystemRuntime, 'connectors' | 'useMock' | 'envFileLoaded'>> {
+export interface ArbitrageServerOptions extends Partial<Pick<SystemRuntime, 'connectors' | 'useMock' | 'envFileLoaded' | 'salesReconciler' | 'envPath'>> {
+  runtime?: SystemRuntime;
   pipeline: ArbitragePipeline;
   db: ArbitrageDatabase;
   inventoryManager: InventoryManager;
@@ -53,7 +57,7 @@ function json(res: ServerResponse, status: number, body?: unknown, headers?: Rec
     ...(body === undefined ? {} : { 'Content-Type': 'application/json; charset=utf-8' }),
     ...headers,
   });
-  res.end(body === undefined ? undefined : JSON.stringify(body));
+  res.end(body === undefined ? undefined : JSON.stringify(redactSecrets(body)));
 }
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
@@ -114,8 +118,8 @@ function decodeId(value: string): string {
 }
 
 export function createArbitrageServer(options: ArbitrageServerOptions): Server {
-  const { pipeline, db, inventoryManager, config, publicDir, mcpHandler, autopilot, marketSync } = options;
-  const fmvEngine = options.fmvEngine ?? new FmvEngine();
+  const { publicDir, mcpHandler, autopilot } = options;
+  const fallbackFmvEngine = options.fmvEngine ?? new FmvEngine();
   const indexPath = publicDir === undefined ? defaultIndex : resolve(publicDir, 'index.html');
 
   const requireAutopilot = () => {
@@ -124,9 +128,10 @@ export function createArbitrageServer(options: ArbitrageServerOptions): Server {
   };
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const localAddress = req.socket.localAddress;
-    if ((localAddress === '127.0.0.1' || localAddress === '::1') &&
-        !/^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(req.headers.host ?? '')) {
+    const runtime = options.runtime ?? options;
+    const { pipeline, db, inventoryManager, config, marketSync, salesReconciler } = runtime;
+    const fmvEngine = runtime.fmvEngine ?? fallbackFmvEngine;
+    if (!/^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(req.headers.host ?? '')) {
       throw new HttpError(403, 'Loopback dashboard requires a local Host header');
     }
     const url = new URL(req.url ?? '/', 'http://localhost');
@@ -149,7 +154,10 @@ export function createArbitrageServer(options: ArbitrageServerOptions): Server {
           json(res, 200, { status: 'ok' });
           return;
         case '/api/readiness':
-          json(res, 200, evaluateReadiness({ ...options, fmvEngine }, { autopilot }));
+          json(res, 200, evaluateReadiness({ ...runtime, fmvEngine }, { autopilot }));
+          return;
+        case '/api/setup-guide':
+          json(res, 200, buildSetupGuide({ ...runtime, fmvEngine }));
           return;
         case '/api/state':
           json(res, 200, db.getDashboardMetrics(config));
@@ -209,6 +217,27 @@ export function createArbitrageServer(options: ArbitrageServerOptions): Server {
       }
 
       switch (pathname) {
+        case '/api/inventory/reconcile-sales': {
+          if (!salesReconciler) throw new HttpError(501, 'Sales reconciler not attached');
+          const body = await readObject(req);
+          const { limit } = body;
+          const sinceIso = optionalText(body.sinceIso, 'sinceIso');
+          if (sinceIso && !Number.isFinite(Date.parse(sinceIso))) throw new HttpError(400, 'sinceIso must be a valid date-time');
+          if (limit !== undefined && (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1 || limit > 200)) {
+            throw new HttpError(400, 'limit must be an integer from 1 to 200');
+          }
+          json(res, 200, await salesReconciler.reconcileSoldOrders({ sinceIso, limit }));
+          return;
+        }
+        case '/api/catalog/expand': {
+          const { pack = 'all_curated' } = await readObject(req);
+          const catalogPack = listCatalogPacks().find(candidate => candidate.name === pack);
+          if (!catalogPack) throw new HttpError(400, 'Unknown catalog pack');
+          const result = installCatalogPack(db, catalogPack.name);
+          autopilot?.refreshBuyBook();
+          json(res, 200, result);
+          return;
+        }
         case '/api/scan':
           await readObject(req);
           json(res, 200, await pipeline.runCycle());
@@ -346,7 +375,7 @@ export function createArbitrageServer(options: ArbitrageServerOptions): Server {
       } else if (error instanceof HttpError || error instanceof InventoryListingError) {
         json(res, error.status, { error: error.message });
       } else {
-        console.error('Dashboard request failed', error);
+        console.error('Dashboard request failed', redactSecrets(error instanceof Error ? error.message : String(error)));
         json(res, 500, { error: 'Internal server error' });
       }
     });

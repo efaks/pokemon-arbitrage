@@ -4,6 +4,8 @@ import type { SupplyConnector } from '../connectors/base.ts';
 import { ageInDays, clamp, percentOfCents } from '../domain/money.ts';
 import type { CycleSummary, ExitChannel, InventoryItem, RawListing } from '../domain/types.ts';
 import type { ExecutionOutcome } from '../execution/executor.ts';
+import type { FulfillmentSyncSummary } from '../liquidation/ebayFulfillment.ts';
+import { redactSecrets } from '../setup/secrets.ts';
 import type { ExitRecommendation } from '../liquidation/inventoryManager.ts';
 import { evaluateSellerTrust } from '../matching/redFlags.ts';
 import type { EvaluateListingResult } from '../pipeline/arbitragePipeline.ts';
@@ -99,6 +101,7 @@ export interface AutopilotCycleSummary {
   cycle: CycleSummary;
   triage: AutonomousTriageSummary;
   repricing: RepricingCycleSummary;
+  reconciliation?: FulfillmentSyncSummary;
   telemetry: ReturnType<AlphaTelemetry['snapshot']>;
 }
 
@@ -123,6 +126,7 @@ const errorMessage = (error: unknown) => error instanceof Error ? error.message 
 export class AutopilotEngine {
   private readonly runtime: SystemRuntime;
   private readonly options: AutopilotConfig;
+  private readonly autoPublishOverride?: boolean;
   private readonly now: () => Date;
   private readonly buyBook = new BuyBook();
   private readonly telemetry = new AlphaTelemetry();
@@ -135,6 +139,7 @@ export class AutopilotEngine {
   constructor(runtime: SystemRuntime, options: { autopilotConfig?: Partial<AutopilotConfig>; nowFn?: () => Date } = {}) {
     this.runtime = runtime;
     this.options = createAutopilotConfig(options.autopilotConfig);
+    this.autoPublishOverride = options.autopilotConfig?.autoPublishListings;
     this.now = options.nowFn ?? (() => new Date());
   }
 
@@ -148,7 +153,7 @@ export class AutopilotEngine {
   }
 
   getAutopilotConfig(): AutopilotConfig {
-    return { ...this.options };
+    return { ...this.options, autoPublishListings: this.autoPublishOverride ?? process.env.ARBITRAGE_AUTO_PUBLISH_LISTINGS === 'true' };
   }
 
   refreshBuyBook(nowIso = this.now().toISOString()): BuyBookEntry[] {
@@ -501,6 +506,7 @@ export class AutopilotEngine {
   private async applyLiveRepricing(nowIso: string): Promise<RepricingCycleSummary> {
     const { db, inventoryManager } = this.runtime;
     const sellerAdapter = inventoryManager.getSellerAdapter();
+    const { autoPublishListings } = this.getAutopilotConfig();
     const { planned, summary } = this.planRepricing(nowIso);
     for (const { item, action } of planned) {
       const current = db.getInventoryItem(item.id);
@@ -512,7 +518,7 @@ export class AutopilotEngine {
         if (item.externalOfferId) {
           if (!canPush || !this.options.pushLiveReprices) continue;
           await inventoryManager.syncReprice(item.id, action.listedPriceCents);
-        } else if (canPush && this.options.autoPublishListings && item.status === 'qc_passed' &&
+        } else if (canPush && autoPublishListings && item.status === 'qc_passed' &&
             action.fulfillment.route === 'direct_marketplace' && action.listedChannel === sellerAdapter.channel) {
           await inventoryManager.publishListing(item.id, { channel: action.listedChannel, priceCents: action.listedPriceCents });
         } else {
@@ -528,6 +534,10 @@ export class AutopilotEngine {
     return summary;
   }
 
+  async reconcileSales(options?: { sinceIso?: string; limit?: number }): Promise<FulfillmentSyncSummary> {
+    return this.track(this.runtime.salesReconciler.reconcileSoldOrders(options));
+  }
+
   runAutopilotPass(options: CycleOptions = {}): Promise<AutopilotCycleSummary> {
     return this.track(this.pass(options));
   }
@@ -540,8 +550,9 @@ export class AutopilotEngine {
       cold: this.buyBook.list({ tier: 'cold' }).length,
     };
     const triage = await this.triage({ nowIso: options.nowIso }, true);
+    const reconciliation = await this.reconcileSales();
     const repricing = await this.runLiveRepricingCycle(options.nowIso);
-    return { buyBook, cycle, triage, repricing, telemetry: this.telemetry.snapshot(this.runtime.db) };
+    return { buyBook, cycle, triage, repricing, reconciliation, telemetry: this.telemetry.snapshot(this.runtime.db) };
   }
 
   startDaemon({ hotIntervalMs = 5000, standardIntervalMs = 30_000, repriceIntervalMs = 60_000, syncIntervalMs }: {
@@ -564,7 +575,7 @@ export class AutopilotEngine {
           try {
             await work();
           } catch (error) {
-            console.error('Scheduled autopilot task failed', error);
+            console.error('Scheduled autopilot task failed', redactSecrets(errorMessage(error)));
           } finally {
             schedule(interval, work);
           }
@@ -579,10 +590,14 @@ export class AutopilotEngine {
     };
     schedule(hotIntervalMs, () => scan('hot'));
     schedule(standardIntervalMs, () => scan('standard'));
-    schedule(repriceIntervalMs, () => this.runLiveRepricingCycle());
+    schedule(repriceIntervalMs, async () => {
+      const reconciliation = await this.reconcileSales();
+      for (const error of reconciliation.errors) console.error('Sale reconciliation failed', redactSecrets(error));
+      if (this.daemon === daemon) await this.runLiveRepricingCycle();
+    });
     if (syncIntervalMs !== undefined) {
-      const { marketSync, fmvEngine, config } = this.runtime;
       schedule(syncIntervalMs, async () => {
+        const { marketSync, fmvEngine, config } = this.runtime;
         const nowIso = this.now().toISOString();
         await marketSync.syncAll({ nowIso, buyBook: this.buyBook, fmvEngine, config });
         this.refreshedAt = nowIso;
