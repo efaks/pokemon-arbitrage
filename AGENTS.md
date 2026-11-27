@@ -22,6 +22,14 @@ The CLI loads `.env` from its working directory. Copy `.env.example` to `.env` a
 
 The `autonomous_buyer` MCP prompt includes these steps and a current readiness snapshot. MCP mode persists in SQLite when `ARBITRAGE_MODE` is unset or blank. A valid `ARBITRAGE_MODE` or explicit `--mode` sets the mode at startup.
 
+## Historical sales and inventory listing
+
+- Import verified sales for existing catalog SKUs with `import_sold_comps` or `npm run import-comps -- --file sales.csv --db data/arbitrage.sqlite`. The CLI accepts CSV and JSON arrays. Check the rejected and duplicate counts, then confirm comp freshness in `check_readiness`.
+- Check the PriceCharting snapshot column against the SKU. Raw uses `loose-price` and sealed uses `new-price`. PSA 10 uses `manual-only-price`, BGS 10 uses `bgs-10-price`, and CGC 10 uses `condition-17-price`. Grade 9.5 uses `box-only-price`, grade 9 uses `graded-price`, grades 8 and 8.5 use `new-price`, and grades 7 and 7.5 use `cib-price`. Wave 8 skips SGC 10.
+- Use `EBAY_SELL_API_TOKEN` or `EBAY_SELL_REFRESH_TOKEN` with OAuth client credentials and the `sell.inventory` scope. Configure `EBAY_FULFILLMENT_POLICY_ID`, `EBAY_PAYMENT_POLICY_ID`, `EBAY_RETURN_POLICY_ID`, and `EBAY_MERCHANT_LOCATION_KEY`. Use `EBAY_SELL_SANDBOX=true` with sandbox credentials and policies for rehearsal.
+- Use the 28-tool MCP server to publish QC-passed inventory with `publish_inventory_listing` and withdraw listings with `withdraw_inventory_listing`. Explicit publication can send an offer to eBay when configured. Use `pushLive: false` for local publication. Confirm operator approval and provide suitable photos before sending a real listing.
+- Set `ARBITRAGE_AUTO_PUBLISH_LISTINGS=true` only for an approved automatic selling run. Live autopilot can publish QC-passed inventory routed to eBay and reprice existing eBay listings. Check `sellCapability`, `readyForLiveAutoSell`, and per-item repricing errors.
+
 ## Purchase guardrails
 
 - Treat readiness as a configuration and data check. Validate approved API scopes, credentials, and budgets with the operator before enabling live checkout.

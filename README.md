@@ -41,6 +41,7 @@ Run commands from the repository root with Node.js 26. Install the development d
 | `npm run bootstrap` | Upsert 20 starter SKUs without fixture sales. Run market sync afterward. |
 | `npm run scan -- --mock --db :memory: --mode shadow` | Run one scan and print the results. |
 | `npm run sync -- --db data/arbitrage.sqlite --limit 50` | Import market data from configured providers and print a JSON summary. |
+| `npm run import-comps -- --file sales.csv --db data/arbitrage.sqlite` | Import historical sales from a CSV or JSON file and report accepted, duplicate, and rejected rows. |
 | `npm run serve -- --mock --db :memory: --mode hitl --port 3000` | Serve the loopback dashboard and MCP HTTP endpoint. Add `--poll-ms 60000` for recurring scans. |
 | `npm run autopilot -- --mock --db :memory: --once` | Run the Buy Book, concurrent scan, triage, and repricing in one pass. |
 | `node src/cli.ts mcp --mock --db :memory: --mode hitl` | Start a simulated MCP server over stdio. |
@@ -58,7 +59,9 @@ Run `node src/cli.ts autopilot --mode shadow --db :memory: --mock --once` for a 
 
 Triage can approve eligible queued orders with a landed cost up to $500 by default. It checks the kill switch, momentum, authorized checkout and cached listing details. Raw approvals also require a trusted seller and at least two photos. Anomalies remain available for operator review unless an explicit triage call opts into rejection. A source is throttled after at least three sales with negative aggregate realized P&L, or after at least three completed checkout attempts if more than half failed. Telemetry reports p50, p95, p99, and max processing and checkout latency plus signal counts, execution rates, and source P&L. Latency samples and intake counters are process-local. Completed orders and sales are read from SQLite.
 
-Fulfillment recommends immediate buylist when its net profit clears the configured minimum and is within 10% of the top exit. For other exits, raw and graded items with at least $250 FMV qualify for vault consignment. Repricing records the route and updates local listing records for QC-passed or listed inventory. The default price discount grows with time since acquisition, up to 8% over 14 days, with a $5 minimum modeled net profit after selling fees, shipping, packaging, and purchase cost. Vault routing is a recommendation. Marketplace listing and vault submission are separate operator actions.
+Fulfillment recommends immediate buylist when its net profit clears the configured minimum and is within 10% of the top exit. For other exits, raw and graded items with at least $250 FMV qualify for vault consignment. The default repricing discount grows with time since acquisition, up to 8% over 14 days, with a $5 minimum modeled net profit after selling fees, shipping, packaging, and purchase cost. Vault routing is a recommendation.
+
+In live mode with the kill switch clear, asynchronous repricing pushes eligible price changes to active eBay offers. Set `ARBITRAGE_AUTO_PUBLISH_LISTINGS=true` to also publish QC-passed items whose direct marketplace route is eBay. Manual publish calls use the chosen channel and an explicit price or the item's FMV. With a configured eBay adapter, an explicit call can publish to eBay. Set `pushLive: false` to record a local listing for a QC-passed item. For eBay publication, provide item photos in `imageUrls` or set a suitable catalog reference image. eBay requires an image and can require category-specific listing details. Withdrawal clears active listing fields and returns the item to QC-passed status, making it eligible for future automatic publication if enabled. [eBay publishing requirements](https://developer.ebay.com/api-docs/sell/static/inventory/publishing-offers.html)
 
 ### Loopback HTTP
 
@@ -72,6 +75,9 @@ Fulfillment recommends immediate buylist when its net profit clears the configur
 | `POST /api/webhooks/listing` | Push a listing through the fast path under the persisted operating mode. |
 | `POST /api/autopilot/pass` | Run a pass using optional JSON field `tier` with `all`, `hot`, `standard`, or `cold`. |
 | `POST /api/sync` | Run market sync using an optional positive integer `limit`, then refresh the Buy Book. |
+| `POST /api/comps/import` | Import historical sales with `comps`, `csv`, or both. |
+| `POST /api/inventory/:id/publish` | Publish a listing with optional `channel`, `listedPriceCents`, `title`, `description`, `imageUrls`, and `pushLive`. |
+| `POST /api/inventory/:id/withdraw` | Withdraw a listing with an optional `reason`. |
 
 For example, push a fixture from the same host while running `serve --mock --mode shadow`.
 
@@ -85,7 +91,7 @@ Supply the source's stable `listingId`, actual seller profile, and checkout capa
 
 ## MCP integration
 
-The server negotiates `2025-03-26` and `2024-11-05`. It exposes 25 tools, 9 resources, and 5 prompts over both transports.
+The server negotiates `2025-03-26` and `2024-11-05`. It exposes 28 tools, 9 resources, and 5 prompts over both transports.
 
 **Stdio.** Launch `node src/cli.ts mcp` directly from a client. The process reads one JSON-RPC frame per line from stdin and writes only JSON-RPC frames to stdout. Use the Node command in client configuration to keep npm's script banner out of the stream.
 
@@ -130,7 +136,10 @@ Use `tools/list` for input schemas and `tools/call` with `params.name` and `para
 | `get_alpha_telemetry` | Read latency percentiles, signal counts, rates, and source throttling. |
 | `ingest_webhook_listing` | Push a listing through the current operating mode, with optional `skipDeduplication`. |
 | `run_autonomous_triage` | Process the review queue with optional `maxApproveCents` and `autoRejectAnomalies`. |
-| `run_repricing_cycle` | Update local listing records based on item age, exit channel, and profit floor. |
+| `run_repricing_cycle` | Calculate listing prices and push eligible changes to active eBay offers in live mode. |
+| `import_sold_comps` | Import `comps`, `csv`, or both, and refresh the Buy Book. |
+| `publish_inventory_listing` | Publish a QC-passed item. Accepts `inventoryId` and optional listing fields. Use `pushLive: false` for local publication. |
+| `withdraw_inventory_listing` | Withdraw an active listing by `inventoryId` with an optional `reason`. |
 | `sync_market_data` | Import market data and refresh the Buy Book. Accepts an optional positive integer `limit`. |
 | `check_readiness` | Check operating mode, kill switch, comp freshness, feed configuration, and checkout capability. |
 | `bootstrap_catalog` | Upsert the starter SKUs and refresh the Buy Book. Set `includeDemoComps: true` only in a demo database. |
@@ -188,6 +197,13 @@ The CLI loads `.env` from the working directory, including when launched over MC
 | `EBAY_REFRESH_TOKEN` | Consented user refresh token for eBay member checkout. Requires both client credentials and approved Order API access. |
 | `EBAY_ACCESS_TOKEN` | Static Browse access token for use without OAuth client credentials. |
 | `EBAY_ORDER_API_TOKEN` | Static Order API user access token for use without member OAuth credentials. |
+| `EBAY_SELL_API_TOKEN` | Static eBay Sell Inventory user access token with the `sell.inventory` scope. |
+| `EBAY_SELL_REFRESH_TOKEN` | Sell Inventory user refresh token. A blank value falls back to `EBAY_REFRESH_TOKEN` when configured. OAuth also requires the client ID, client secret, and Sell Inventory scope. |
+| `EBAY_FULFILLMENT_POLICY_ID` | Seller's eBay US shipping policy ID. |
+| `EBAY_PAYMENT_POLICY_ID` | Seller's eBay US payment policy ID. |
+| `EBAY_RETURN_POLICY_ID` | Seller's eBay US return policy ID. |
+| `EBAY_MERCHANT_LOCATION_KEY` | Key of the seller's registered eBay inventory location. |
+| `EBAY_SELL_SANDBOX` | Set to `true` to use eBay sandbox Sell Inventory and OAuth endpoints. |
 | `POKEMON_TCG_API_KEY` | Enables the Pokémon TCG API catalog and TCGplayer market price sync. |
 | `PRICECHARTING_API_TOKEN` | Enables PriceCharting price snapshots. |
 | `EBAY_INSIGHTS_ENABLED` | Set to `true` to enable sold comps with an approved Marketplace Insights token or OAuth credentials. |
@@ -211,6 +227,7 @@ The CLI loads `.env` from the working directory, including when launched over MC
 | --- | --- |
 | `ARBITRAGE_DB_PATH` | `data/arbitrage.sqlite` |
 | `ARBITRAGE_MODE` | New databases start in `shadow`. `serve` defaults to `hitl`. |
+| `ARBITRAGE_AUTO_PUBLISH_LISTINGS` | Disabled. Set to `true` to enable automatic publication on the eBay route in live mode. |
 | `ARBITRAGE_MIN_PROFIT_CENTS` | `1500` |
 | `ARBITRAGE_MIN_NET_ROI` | `0.15` |
 | `ARBITRAGE_MIN_LIQUIDITY_SCORE` | `0.30` |
@@ -239,7 +256,36 @@ npm run sync -- --db data/arbitrage.sqlite --limit 10
 curl http://127.0.0.1:3000/api/sync -H 'Content-Type: application/json' -d '{"limit":10}'
 ```
 
-TCGplayer and PriceCharting imports are market price snapshots that feed valuation. PriceCharting's `graded-price` is an aggregate grade-9 figure for cards. Check that imported prices and grade assumptions fit the SKUs you plan to trade. Marketplace Insights provides eBay sales and requires limited-release access and approved search categories. [Pokémon TCG card data](https://docs.pokemontcg.io/api-reference/cards/card-object/) · [PriceCharting price fields](https://www.pricecharting.com/api-documentation) · [eBay Buy API requirements](https://developer.ebay.com/api-docs/buy/buy-requirements.html)
+TCGplayer and PriceCharting imports are market price snapshots that feed valuation. Marketplace Insights provides eBay sales and requires limited-release access and approved search categories. [Pokémon TCG card data](https://docs.pokemontcg.io/api-reference/cards/card-object/) · [eBay Buy API requirements](https://developer.ebay.com/api-docs/buy/buy-requirements.html)
+
+| SKU tier | PriceCharting field |
+| --- | --- |
+| Raw | `loose-price` |
+| Sealed | `new-price` |
+| PSA 10 | `manual-only-price` |
+| BGS 10 | `bgs-10-price` |
+| CGC 10 | `condition-17-price` |
+| Grade 9.5 | `box-only-price` |
+| Grade 9 | `graded-price` |
+| Grade 8 or 8.5 | `new-price` |
+| Grade 7 or 7.5 | `cib-price` |
+
+Wave 8 skips unsupported tiers, including SGC 10, whose `condition-18-price` is recognized as an API field. Existing snapshots stay in the database. [PriceCharting price fields](https://www.pricecharting.com/api-documentation)
+
+### Importing historical sales
+
+Use catalog SKU IDs, a supported source such as `ebay` or `tcgplayer`, a positive sale price, and a timezone-qualified ISO 8601 sale timestamp. CSV supports `soldPriceCents` or `soldPriceUsd` and optional `shippingCents` or `shippingUsd`. JSON uses a top-level array with integer-cent fields. Both accept optional `condition`, `grader`, `grade`, and `id`. The importer defaults to zero shipping, uses the SKU's grader and grade when omitted, and derives a stable ID for rows without one.
+
+```csv
+skuId,source,soldPriceUsd,shippingUsd,soldAt,id
+sealed-ssp-bb,ebay,165.50,5.00,2026-11-26T16:00:00Z,sale-001
+```
+
+```sh
+npm run import-comps -- --file sales.csv --db data/arbitrage.sqlite
+```
+
+Check the returned `inserted`, `duplicatesSkipped`, and `rejected` counts. Fresh sales affect FMV as soon as enough eligible comps are present. HTTP and MCP imports refresh the in-process Buy Book immediately.
 
 ## Going Live Checklist
 

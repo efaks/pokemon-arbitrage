@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { SystemRuntime } from '../cli.ts';
 import type { SupplyConnector } from '../connectors/base.ts';
 import { ageInDays, clamp, percentOfCents } from '../domain/money.ts';
-import type { CycleSummary, ExitChannel, RawListing } from '../domain/types.ts';
+import type { CycleSummary, ExitChannel, InventoryItem, RawListing } from '../domain/types.ts';
 import type { ExecutionOutcome } from '../execution/executor.ts';
 import type { ExitRecommendation } from '../liquidation/inventoryManager.ts';
 import { evaluateSellerTrust } from '../matching/redFlags.ts';
@@ -23,13 +23,16 @@ export interface AutopilotConfig {
   repricingTargetDays: number;
   repricingMaxDiscountPct: number;
   repricingFloorProfitCents: number;
+  autoPublishListings: boolean;
+  pushLiveReprices: boolean;
 }
 
 export function createAutopilotConfig(overrides: Partial<AutopilotConfig> = {}): AutopilotConfig {
   const config: AutopilotConfig = {
     autonomousTriageEnabled: true, autonomousMaxApproveCents: 50_000, allowAutonomousRawApproval: true,
     autoRejectAnomalies: false, suppressFallingKnife: true, vaultThresholdCents: 25_000,
-    repricingTargetDays: 14, repricingMaxDiscountPct: 0.08, repricingFloorProfitCents: 500, ...overrides,
+    repricingTargetDays: 14, repricingMaxDiscountPct: 0.08, repricingFloorProfitCents: 500,
+    autoPublishListings: process.env.ARBITRAGE_AUTO_PUBLISH_LISTINGS === 'true', pushLiveReprices: true, ...overrides,
   };
   if (![config.autonomousMaxApproveCents, config.vaultThresholdCents, config.repricingFloorProfitCents]
     .every(value => Number.isSafeInteger(value) && value >= 0)) throw new RangeError('Autopilot monetary limits must be nonnegative integer cents');
@@ -88,6 +91,7 @@ export interface RepricingCycleSummary {
   repricedCount: number;
   skippedBelowFloorCount: number;
   actions: RepricingAction[];
+  errors?: string[];
 }
 
 export interface AutopilotCycleSummary {
@@ -125,6 +129,7 @@ export class AutopilotEngine {
   private readonly pending = new Set<Promise<unknown>>();
   private refreshedAt?: string;
   private scanTail = Promise.resolve();
+  private repricingTail = Promise.resolve();
   private daemon?: Set<ReturnType<typeof setTimeout>>;
 
   constructor(runtime: SystemRuntime, options: { autopilotConfig?: Partial<AutopilotConfig>; nowFn?: () => Date } = {}) {
@@ -423,22 +428,25 @@ export class AutopilotEngine {
     };
   }
 
-  runRepricingCycle(nowIso = this.now().toISOString()): RepricingCycleSummary {
+  private planRepricing(nowIso: string) {
     const { db, config, inventoryManager } = this.runtime;
     const items = [...db.listInventory('qc_passed'), ...db.listInventory('listed')];
-    const summary: RepricingCycleSummary = { inspectedCount: items.length, repricedCount: 0, skippedBelowFloorCount: 0, actions: [] };
+    let skippedBelowFloorCount = 0;
+    const planned: { item: InventoryItem; action: RepricingAction }[] = [];
     for (const item of items) {
       const recommendation = inventoryManager.recommendExit(item.id, nowIso);
-      const fulfillment = this.route(recommendation, item.assetClass);
-      const channel = fulfillment.channel;
+      const route = this.route(recommendation, item.assetClass);
+      const channel = item.externalOfferId && item.listedChannel ? item.listedChannel : route.channel;
       const exit = recommendation.channels.find(candidate => candidate.exitChannel === channel)!;
+      const fulfillment: FulfillmentRoute = channel === route.channel ? route
+        : { ...route, channel, route: 'direct_marketplace', expectedNetProfitCents: exit.netProfitCents };
       const schedule = config.exitFeeSchedules[channel];
       const netProfit = (gross: number) => gross - percentOfCents(gross, schedule.percentFee) - schedule.fixedFeeCents -
         exit.outboundShippingCents - exit.packagingCents - item.costBasisCents;
       const target = exit.expectedExitPriceCents;
       const floor = this.options.repricingFloorProfitCents;
       if (target < 1 || netProfit(target) < floor) {
-        summary.skippedBelowFloorCount++;
+        skippedBelowFloorCount++;
         continue;
       }
 
@@ -453,15 +461,70 @@ export class AutopilotEngine {
       }
       const listedPriceCents = low;
       if (item.status === 'listed' && item.listedChannel === channel && item.listedPriceCents === listedPriceCents) continue;
-      db.updateInventoryItem(item.id, { listedChannel: channel, listedPriceCents, status: 'listed' });
       const action: RepricingAction = {
         inventoryId: item.id, fulfillment, previousPriceCents: item.listedPriceCents, listedChannel: channel,
         listedPriceCents, expectedNetProfitCents: netProfit(listedPriceCents), ageDays,
       };
-      db.logAuditEvent('autopilot.repriced', { ...action });
-      summary.actions.push(action);
+      planned.push({ item, action });
     }
+    const summary: RepricingCycleSummary = { inspectedCount: items.length, repricedCount: 0, skippedBelowFloorCount, actions: [] };
+    return { planned, summary };
+  }
+
+  private recordReprice(summary: RepricingCycleSummary, action: RepricingAction): void {
+    this.runtime.db.logAuditEvent('autopilot.repriced', { ...action });
+    summary.actions.push(action);
     summary.repricedCount = summary.actions.length;
+  }
+
+  runRepricingCycle(nowIso = this.now().toISOString()): RepricingCycleSummary {
+    const { inventoryManager } = this.runtime;
+    const { planned, summary } = this.planRepricing(nowIso);
+    for (const { item, action } of planned) {
+      if (item.externalOfferId) continue;
+      try {
+        inventoryManager.markListed(item.id, action.listedChannel, action.listedPriceCents);
+        this.recordReprice(summary, action);
+      } catch (error) {
+        (summary.errors ??= []).push(`${item.id}: ${errorMessage(error)}`);
+      }
+    }
+    return summary;
+  }
+
+  async runLiveRepricingCycle(nowIso?: string): Promise<RepricingCycleSummary> {
+    const task = this.repricingTail.then(() => this.applyLiveRepricing(nowIso ?? this.now().toISOString()));
+    this.repricingTail = task.then(() => undefined, () => undefined);
+    return this.track(task);
+  }
+
+  private async applyLiveRepricing(nowIso: string): Promise<RepricingCycleSummary> {
+    const { db, inventoryManager } = this.runtime;
+    const sellerAdapter = inventoryManager.getSellerAdapter();
+    const { planned, summary } = this.planRepricing(nowIso);
+    for (const { item, action } of planned) {
+      const current = db.getInventoryItem(item.id);
+      if (!current || current.updatedAt !== item.updatedAt || current.status !== item.status ||
+          current.listedPriceCents !== item.listedPriceCents || current.externalOfferId !== item.externalOfferId) continue;
+      const state = db.getSystemState();
+      const canPush = state.operatingMode === 'live' && !state.killSwitchEngaged && sellerAdapter.isConfigured();
+      try {
+        if (item.externalOfferId) {
+          if (!canPush || !this.options.pushLiveReprices) continue;
+          await inventoryManager.syncReprice(item.id, action.listedPriceCents);
+        } else if (canPush && this.options.autoPublishListings && item.status === 'qc_passed' &&
+            action.fulfillment.route === 'direct_marketplace' && action.listedChannel === sellerAdapter.channel) {
+          await inventoryManager.publishListing(item.id, { channel: action.listedChannel, priceCents: action.listedPriceCents });
+        } else {
+          inventoryManager.markListed(item.id, action.listedChannel, action.listedPriceCents);
+        }
+        this.recordReprice(summary, action);
+      } catch (error) {
+        const reason = errorMessage(error);
+        (summary.errors ??= []).push(`${item.id}: ${reason}`);
+        db.logAuditEvent('autopilot.reprice_failed', { inventoryId: item.id, reason });
+      }
+    }
     return summary;
   }
 
@@ -477,7 +540,7 @@ export class AutopilotEngine {
       cold: this.buyBook.list({ tier: 'cold' }).length,
     };
     const triage = await this.triage({ nowIso: options.nowIso }, true);
-    const repricing = this.runRepricingCycle(options.nowIso);
+    const repricing = await this.runLiveRepricingCycle(options.nowIso);
     return { buyBook, cycle, triage, repricing, telemetry: this.telemetry.snapshot(this.runtime.db) };
   }
 
@@ -516,7 +579,7 @@ export class AutopilotEngine {
     };
     schedule(hotIntervalMs, () => scan('hot'));
     schedule(standardIntervalMs, () => scan('standard'));
-    schedule(repriceIntervalMs, () => this.runRepricingCycle());
+    schedule(repriceIntervalMs, () => this.runLiveRepricingCycle());
     if (syncIntervalMs !== undefined) {
       const { marketSync, fmvEngine, config } = this.runtime;
       schedule(syncIntervalMs, async () => {

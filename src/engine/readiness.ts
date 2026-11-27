@@ -1,8 +1,10 @@
 import type { SystemRuntime } from '../cli.ts';
 import type { OperatingMode } from '../domain/types.ts';
 import type { AutopilotEngine } from './autopilot.ts';
+import { EbaySellInventoryAdapter, SimulatedSellerAdapter } from '../liquidation/ebaySellerAdapter.ts';
 
 export type CheckoutCapability = 'simulated' | 'ebay_oauth_live' | 'ebay_static_token' | 'manual_only';
+export type SellCapability = 'simulated' | 'ebay_sell_oauth_live' | 'ebay_sell_static_token' | 'local_only';
 
 export interface ReadinessReport {
   nodeVersion: string;
@@ -19,19 +21,21 @@ export interface ReadinessReport {
   enabledSyncers: string[];
   disabledSyncers: string[];
   checkoutCapability: CheckoutCapability;
+  sellCapability: SellCapability;
   certVerifier: 'mock' | 'psa_live' | 'psa_unconfigured';
   visionVerifier: 'openai_live' | 'heuristic';
   webhookAlertingEnabled: boolean;
   readyForShadowScan: boolean;
   readyForHitlAlerts: boolean;
   readyForLiveAutoBuy: boolean;
+  readyForLiveAutoSell: boolean;
   blockingIssues: string[];
   warnings: string[];
   recommendedNextActions: string[];
 }
 
 type ReadinessRuntime = Pick<SystemRuntime, 'db' | 'config' | 'fmvEngine' | 'envFileLoaded' | 'useMock'>
-  & Partial<Pick<SystemRuntime, 'connectors' | 'marketSync'>>;
+  & Partial<Pick<SystemRuntime, 'connectors' | 'marketSync' | 'inventoryManager'>>;
 
 function splitByEnabled(sources: readonly { name: string; isEnabled(): boolean }[]) {
   const enabled: string[] = [];
@@ -61,6 +65,11 @@ export function evaluateReadiness(
   const checkoutCapability: CheckoutCapability = useMock ? 'simulated'
     : ebayOAuth ? 'ebay_oauth_live'
       : envSet('EBAY_ORDER_API_TOKEN') ? 'ebay_static_token' : 'manual_only';
+  const seller = runtime.inventoryManager?.getSellerAdapter() ?? new EbaySellInventoryAdapter();
+  const sellCapability: SellCapability = useMock || seller instanceof SimulatedSellerAdapter ? 'simulated'
+    : seller instanceof EbaySellInventoryAdapter && seller.isConfigured()
+      ? seller.getAuthKind() === 'oauth' ? 'ebay_sell_oauth_live' : 'ebay_sell_static_token'
+      : 'local_only';
   const certVerifier = useMock ? 'mock' : envSet('PSA_API_TOKEN') ? 'psa_live' : 'psa_unconfigured';
   const visionVerifier = !useMock && envSet('VISION_API_KEY') && envSet('VISION_API_URL') ? 'openai_live' : 'heuristic';
   const webhookAlertingEnabled = !useMock && envSet('ARBITRAGE_WEBHOOK_URL');
@@ -68,6 +77,7 @@ export function evaluateReadiness(
   const readyForShadowScan = !killSwitchEngaged && catalogSkuCount > 0 && freshCompSkuCount > 0 && enabledConnectors.length > 0;
   const readyForHitlAlerts = readyForShadowScan && (operatingMode === 'hitl' || operatingMode === 'live');
   const readyForLiveAutoBuy = readyForShadowScan && operatingMode === 'live' && checkoutCapability !== 'manual_only';
+  const readyForLiveAutoSell = readyForShadowScan && operatingMode === 'live' && sellCapability !== 'local_only';
   const blockingIssues: string[] = [];
   const warnings: string[] = [];
   const recommendedNextActions: string[] = [];
@@ -109,6 +119,10 @@ export function evaluateReadiness(
   } else if (useMock) {
     warnings.push('The mock runtime uses simulated checkout.');
   }
+  if (sellCapability === 'local_only') {
+    warnings.push('Selling is local only. eBay Sell Inventory credentials, policies, or location are missing.');
+    recommendedNextActions.push('Configure authorized eBay Sell Inventory credentials, all three business policy IDs, and the merchant location key.');
+  }
   if (certVerifier === 'psa_unconfigured') warnings.push('PSA_API_TOKEN is missing. Graded listings may require certificate review.');
   if (!useMock && visionVerifier === 'heuristic') warnings.push('Photo assessment uses heuristics. Set VISION_API_URL and VISION_API_KEY for live vision.');
   if (!useMock && !webhookAlertingEnabled) warnings.push('External webhook alerts are disabled. Set ARBITRAGE_WEBHOOK_URL to enable them.');
@@ -119,7 +133,7 @@ export function evaluateReadiness(
   return {
     nodeVersion: process.version, dbPath: config.dbPath, operatingMode, killSwitchEngaged, killSwitchReason,
     envFileLoaded, catalogSkuCount, freshCompSkuCount, staleCompSkuCount, enabledConnectors, disabledConnectors,
-    enabledSyncers, disabledSyncers, checkoutCapability, certVerifier, visionVerifier, webhookAlertingEnabled,
-    readyForShadowScan, readyForHitlAlerts, readyForLiveAutoBuy, blockingIssues, warnings, recommendedNextActions,
+    enabledSyncers, disabledSyncers, checkoutCapability, sellCapability, certVerifier, visionVerifier, webhookAlertingEnabled,
+    readyForShadowScan, readyForHitlAlerts, readyForLiveAutoBuy, readyForLiveAutoSell, blockingIssues, warnings, recommendedNextActions,
   };
 }

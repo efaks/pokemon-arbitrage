@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { seedCanonicalCatalog, seedStarterSkus } from './catalog/seed.ts';
@@ -21,6 +23,7 @@ import type { ReadinessReport } from './engine/readiness.ts';
 import { loadProjectEnv } from './env.ts';
 import { EbayOrderApiExecutor, ExecutionCoordinator, SimulatedApiExecutor } from './execution/executor.ts';
 import { InventoryManager } from './liquidation/inventoryManager.ts';
+import { EbaySellInventoryAdapter, SimulatedSellerAdapter } from './liquidation/ebaySellerAdapter.ts';
 import { MockCertVerifier, PsaHttpCertVerifier } from './matching/certVerifier.ts';
 import { EntityResolver } from './matching/entityResolver.ts';
 import { HeuristicVisionVerifier, OpenAICompatibleVisionVerifier } from './matching/visionVerifier.ts';
@@ -29,6 +32,8 @@ import { StdioMcpTransport } from './mcp/stdioTransport.ts';
 import { CompositeNotifier, ConsoleNotifier, NullNotifier, WebhookNotifier } from './notifications/notifier.ts';
 import { ArbitragePipeline } from './pipeline/arbitragePipeline.ts';
 import { createArbitrageServer } from './server/httpServer.ts';
+import { importSoldComps, parseSoldCompsCsv } from './sync/compImporter.ts';
+import type { ImportCompInput } from './sync/compImporter.ts';
 import { EbaySoldCompsSyncer, MarketSyncCoordinator, PokemonTcgApiCatalogSyncer, PriceChartingSyncer } from './sync/marketSync.ts';
 import { FmvEngine } from './valuation/fmvEngine.ts';
 
@@ -92,7 +97,8 @@ export function createSystemRuntime(options: SystemRuntimeOptions = {}): SystemR
     // The coordinator checks the persisted mode. Keep the real adapter ready for dashboard mode changes.
     const adapter = options.useMock ? new SimulatedApiExecutor(options.simulationOverrides) : new EbayOrderApiExecutor();
     const executor = new ExecutionCoordinator({ db, config, adapter });
-    const inventoryManager = new InventoryManager(db, fmvEngine, config);
+    const sellerAdapter = options.useMock ? new SimulatedSellerAdapter() : new EbaySellInventoryAdapter();
+    const inventoryManager = new InventoryManager(db, fmvEngine, config, sellerAdapter);
     const notifier = !options.useMock && process.env.ARBITRAGE_WEBHOOK_URL?.trim()
       ? new CompositeNotifier([new WebhookNotifier(), ...(options.quiet ? [] : [new ConsoleNotifier()])])
       : options.quiet ? new NullNotifier() : new ConsoleNotifier();
@@ -171,12 +177,13 @@ function printAutopilot(summary: AutopilotCycleSummary): void {
   console.table([triageTotals]);
   if (triageActions.length) console.table(triageActions);
   console.log('Repricing and vault routing');
-  const { actions, ...repricingTotals } = summary.repricing;
+  const { actions, errors, ...repricingTotals } = summary.repricing;
   console.table([repricingTotals]);
   if (actions.length) console.table(actions.map(action => ({
     Inventory: action.inventoryId, Route: action.fulfillment.route, Channel: action.listedChannel,
     'Listed price': formatUsd(action.listedPriceCents), 'Expected net': formatUsd(action.expectedNetProfitCents),
   })));
+  for (const error of errors ?? []) console.error(`Repricing failed for ${error}`);
   const { detectToDecision, decisionToFill, ...telemetry } = summary.telemetry;
   console.log(`Latency telemetry (${telemetry.samplesCount} decisions, milliseconds)`);
   const roundLatency = ({ p50Ms, p95Ms, p99Ms, maxMs }: typeof detectToDecision) => ({
@@ -208,6 +215,7 @@ const usage = `Usage: node src/cli.ts <command>
   serve [--port 3000] [--mode hitl] [--db data/arbitrage.sqlite] [--mock] [--poll-ms 0]
   mcp   [--mode shadow|hitl|live] [--db data/arbitrage.sqlite] [--mock]
   sync  [--db data/arbitrage.sqlite] [--limit 50]
+  import-comps --file <path> [--db data/arbitrage.sqlite]
   autopilot [--mode live|hitl|shadow] [--db data/arbitrage.sqlite] [--mock] [--once]
             [--hot-ms 5000] [--standard-ms 30000] [--reprice-ms 60000] [--sync-ms milliseconds]`;
 
@@ -227,7 +235,7 @@ async function main(args: string[]): Promise<void> {
     return;
   }
   if (command === 'demo' && flags.length === 0) return demo();
-  if (!['scan', 'serve', 'mcp', 'autopilot', 'sync', 'bootstrap', 'doctor'].includes(command)) {
+  if (!['scan', 'serve', 'mcp', 'autopilot', 'sync', 'bootstrap', 'doctor', 'import-comps'].includes(command)) {
     throw new Error(usage);
   }
 
@@ -237,7 +245,7 @@ async function main(args: string[]): Promise<void> {
       mode: { type: 'string' }, db: { type: 'string' }, mock: { type: 'boolean' },
       port: { type: 'string' }, 'poll-ms': { type: 'string' },
       once: { type: 'boolean' }, 'hot-ms': { type: 'string' }, 'standard-ms': { type: 'string' }, 'reprice-ms': { type: 'string' },
-      'sync-ms': { type: 'string' }, limit: { type: 'string' }, json: { type: 'boolean' },
+      'sync-ms': { type: 'string' }, limit: { type: 'string' }, json: { type: 'boolean' }, file: { type: 'string' },
     },
   });
   const mode = Object.values(OperatingMode).find(candidate => candidate === values.mode);
@@ -248,9 +256,27 @@ async function main(args: string[]): Promise<void> {
     .some(value => value !== undefined)) throw new Error(usage);
   if (command !== 'sync' && values.limit !== undefined) throw new Error(usage);
   if (command !== 'doctor' && values.json !== undefined) throw new Error(usage);
+  if (command !== 'import-comps' && values.file !== undefined) throw new Error(usage);
 
-  if (['sync', 'doctor', 'bootstrap'].includes(command) && mode !== undefined) throw new Error(usage);
-  if ((command === 'sync' || command === 'bootstrap') && values.mock !== undefined) throw new Error(usage);
+  if (['sync', 'doctor', 'bootstrap', 'import-comps'].includes(command) && mode !== undefined) throw new Error(usage);
+  if (['sync', 'bootstrap', 'import-comps'].includes(command) && values.mock !== undefined) throw new Error(usage);
+
+  if (command === 'import-comps') {
+    if (!values.file) throw new Error('import-comps requires --file');
+    const extension = extname(values.file).toLowerCase();
+    if (extension !== '.csv' && extension !== '.json') throw new Error('Sold comp file must be .csv or .json');
+    const file = readFileSync(values.file, 'utf8');
+    const inputs: unknown = extension === '.csv' ? parseSoldCompsCsv(file) : JSON.parse(file);
+    if (!Array.isArray(inputs)) throw new Error('Sold comp JSON must contain an array');
+    const { dbPath } = createConfig(values.db === undefined ? {} : { dbPath: values.db });
+    const db = new ArbitrageDatabase(dbPath);
+    try {
+      console.log(JSON.stringify(importSoldComps(db, inputs as ImportCompInput[]), null, 2));
+    } finally {
+      db.close();
+    }
+    return;
+  }
 
   if (command === 'bootstrap') {
     const { dbPath } = createConfig(values.db === undefined ? {} : { dbPath: values.db });

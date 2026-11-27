@@ -12,6 +12,7 @@
     "bootstrap": "node src/cli.ts bootstrap",
     "scan": "node src/cli.ts scan",
     "sync": "node src/cli.ts sync",
+    "import-comps": "node src/cli.ts import-comps",
     "serve": "node src/cli.ts serve",
     "mcp": "node src/cli.ts mcp",
     "autopilot": "node src/cli.ts autopilot"

@@ -295,6 +295,9 @@ export interface InventoryItem {
   qcNotes?: string;
   listedChannel?: ExitChannel;
   listedPriceCents?: number;
+  externalOfferId?: string;
+  externalListingId?: string;
+  externalListingUrl?: string;
   soldChannel?: ExitChannel;
   soldPriceCents?: number;
   exitFeesCents?: number;

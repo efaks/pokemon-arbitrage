@@ -150,6 +150,9 @@ const SCHEMA = `
     qc_notes TEXT,
     listed_channel TEXT,
     listed_price_cents INTEGER,
+    external_offer_id TEXT,
+    external_listing_id TEXT,
+    external_listing_url TEXT,
     sold_channel TEXT,
     sold_price_cents INTEGER,
     exit_fees_cents INTEGER,
@@ -327,6 +330,9 @@ function readInventory(row: Row): InventoryItem {
     qcNotes: optional<string>(row.qc_notes),
     listedChannel: optional<ExitChannel>(row.listed_channel),
     listedPriceCents: optional<number>(row.listed_price_cents),
+    externalOfferId: optional<string>(row.external_offer_id),
+    externalListingId: optional<string>(row.external_listing_id),
+    externalListingUrl: optional<string>(row.external_listing_url),
     soldChannel: optional<ExitChannel>(row.sold_channel),
     soldPriceCents: optional<number>(row.sold_price_cents),
     exitFeesCents: optional<number>(row.exit_fees_cents),
@@ -375,6 +381,9 @@ const INVENTORY_COLUMNS = {
   qcNotes: 'qc_notes',
   listedChannel: 'listed_channel',
   listedPriceCents: 'listed_price_cents',
+  externalOfferId: 'external_offer_id',
+  externalListingId: 'external_listing_id',
+  externalListingUrl: 'external_listing_url',
   soldChannel: 'sold_channel',
   soldPriceCents: 'sold_price_cents',
   exitFeesCents: 'exit_fees_cents',
@@ -398,6 +407,12 @@ export class ArbitrageDatabase {
       this.db.exec('PRAGMA foreign_keys = ON;');
       if (dbPath !== ':memory:') this.db.exec('PRAGMA journal_mode = WAL;');
       this.db.exec(SCHEMA);
+      this.transaction('BEGIN IMMEDIATE', () => {
+        const columns = new Set(this.db.prepare('PRAGMA table_info(inventory_items)').all().map(row => row.name));
+        for (const column of ['external_offer_id', 'external_listing_id', 'external_listing_url']) {
+          if (!columns.has(column)) this.db.exec(`ALTER TABLE inventory_items ADD COLUMN ${column} TEXT`);
+        }
+      });
       this.db.prepare(`
         INSERT OR IGNORE INTO system_state
           (id, operating_mode, kill_switch_engaged, consecutive_errors, updated_at)

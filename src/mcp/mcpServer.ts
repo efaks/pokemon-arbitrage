@@ -10,6 +10,8 @@ import type { RawListing, SoldComp } from '../domain/types.ts';
 import { AutopilotEngine } from '../engine/autopilot.ts';
 import { evaluateReadiness } from '../engine/readiness.ts';
 import type { McpHttpHandler } from '../server/httpServer.ts';
+import { importSoldComps, parseSoldCompsCsv } from '../sync/compImporter.ts';
+import type { ImportCompInput } from '../sync/compImporter.ts';
 import {
   JSON_RPC_ERROR_CODES as codes, jsonRpcError, jsonRpcSuccess, mcpToolError, mcpToolSuccess,
   SUPPORTED_PROTOCOL_VERSIONS,
@@ -388,6 +390,15 @@ function makeTools(runtime: SystemRuntime, autopilot: AutopilotEngine): Tool[] {
     tool('recommend_exit_channel', 'Compare estimated sale proceeds and recommend an exit channel.',
       object({ inventoryId: nonBlank }, 'inventoryId'), readOnly,
       ({ inventoryId }) => ({ ...inventoryManager.recommendExit(inventoryId) })),
+    tool('publish_inventory_listing', 'Publish QC-passed inventory locally or through the configured eBay Sell API.',
+      object({
+        inventoryId: nonBlank, channel: choice(ExitChannel), listedPriceCents: positiveMoney, title: text,
+        description: text, imageUrls: array(nonBlank), pushLive: boolean,
+      }, 'inventoryId'), checkout, async ({ inventoryId, ...input }) =>
+        ({ item: await inventoryManager.publishListing(inventoryId, input) })),
+    tool('withdraw_inventory_listing', 'Withdraw an active local or eBay listing and return the item to QC-passed inventory.',
+      object({ inventoryId: nonBlank, reason: text }, 'inventoryId'), checkout,
+      async ({ inventoryId, reason }) => ({ item: await inventoryManager.withdrawListing(inventoryId, reason) })),
     tool('record_inventory_sale', 'Record a completed sale with its price and optional fees in USD cents.',
       object({ inventoryId: nonBlank, exitChannel: choice(ExitChannel), soldPriceCents: positiveMoney, exitFeesCents: money },
         'inventoryId', 'exitChannel', 'soldPriceCents'), localWrite, ({ inventoryId, ...input }) =>
@@ -409,12 +420,19 @@ function makeTools(runtime: SystemRuntime, autopilot: AutopilotEngine): Tool[] {
     tool('run_autonomous_triage', 'Triage pending orders and submit eligible approvals to sanctioned checkout.', object({
       maxApproveCents: money, autoRejectAnomalies: boolean,
     }), checkout, async args => ({ ...await autopilot.runAutonomousTriage(args) })),
-    tool('run_repricing_cycle', 'Update local listing prices for QC-passed and listed inventory.', noArgs, localWrite,
-      () => ({ ...autopilot.runRepricingCycle() })),
+    tool('run_repricing_cycle', 'Update listing prices and push eligible changes through the selling adapter.', noArgs, checkout,
+      async () => ({ ...await autopilot.runLiveRepricingCycle() })),
+    tool('import_sold_comps',
+      'Import sales from CSV or objects with skuId, source, soldPriceCents, soldAt, and optional id, shippingCents, condition, grader, and grade.',
+      object({ comps: array({ type: 'object', additionalProperties: true }), csv: text }), localWrite, ({ comps, csv }) => {
+        if (comps === undefined && csv === undefined) throw new ToolFailure('Provide comps or csv');
+        const inputs = [...(comps as ImportCompInput[] | undefined ?? []), ...(csv === undefined ? [] : parseSoldCompsCsv(csv))];
+        return { ...importSoldComps(db, inputs, { buyBook: autopilot.getBuyBook(), fmvEngine, config }) };
+      }),
     tool('sync_market_data', 'Import catalog and price data from enabled providers and refresh the Buy Book.',
       object({ limit }), { ...localWrite, openWorldHint: true, destructiveHint: false },
       async ({ limit }) => ({ ...await syncMarketData(limit) })),
-    tool('check_readiness', 'Check catalog freshness, enabled providers, checkout capability, and setup blockers.',
+    tool('check_readiness', 'Check catalog freshness, enabled providers, buying and selling capability, and setup blockers.',
       noArgs, readOnly, () => ({ ...evaluateReadiness(runtime, { autopilot }) })),
     tool('bootstrap_catalog', 'Upsert the 20 starter SKUs. Include fixture sales only in a separate demo database.',
       object({ includeDemoComps: boolean }), localWrite, ({ includeDemoComps }) => {

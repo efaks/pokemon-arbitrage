@@ -180,13 +180,29 @@ export class PokemonTcgApiCatalogSyncer implements MarketSyncProvider {
   }
 }
 
-interface PriceChartingProduct {
+export type PriceChartingPriceField = 'loose-price' | 'cib-price' | 'new-price' | 'graded-price' |
+  'box-only-price' | 'manual-only-price' | 'bgs-10-price' | 'condition-17-price' | 'condition-18-price';
+
+interface PriceChartingProduct extends Partial<Record<PriceChartingPriceField, number>> {
   id?: string;
   'product-name'?: string;
   'console-name'?: string;
-  'loose-price'?: number;
-  'new-price'?: number;
-  'graded-price'?: number;
+}
+
+export function priceChartingFieldForSku(sku: CanonicalSku): PriceChartingPriceField | undefined {
+  if (sku.assetClass === 'sealed') return 'new-price';
+  if (sku.assetClass === 'raw') return 'loose-price';
+  const grade = Number(sku.grade);
+  if (grade === 10) {
+    if (sku.grader === 'PSA') return 'manual-only-price';
+    if (sku.grader === 'BGS') return 'bgs-10-price';
+    if (sku.grader === 'CGC') return 'condition-17-price';
+    return undefined;
+  }
+  if (grade === 9.5) return 'box-only-price';
+  if (grade === 9) return 'graded-price';
+  if (grade === 8 || grade === 8.5) return 'new-price';
+  if (grade === 7 || grade === 7.5) return 'cib-price';
 }
 
 function skuQuery(sku: CanonicalSku): string {
@@ -229,6 +245,8 @@ export class PriceChartingSyncer implements MarketSyncProvider {
     const now = options.nowIso ?? new Date().toISOString();
     const day = now.slice(0, 10);
     for (const sku of db.listSkus().slice(0, runLimit(options.limit))) {
+      const field = priceChartingFieldForSku(sku);
+      if (!field) continue;
       try {
         const search = new URL(`${this.baseUrl}/api/products`);
         const query = sku.cardNumber
@@ -248,7 +266,6 @@ export class PriceChartingSyncer implements MarketSyncProvider {
           }
         }
         if (!best) continue;
-        const field = sku.assetClass === 'sealed' ? 'new-price' : sku.assetClass === 'graded' ? 'graded-price' : 'loose-price';
         let cents = best[field];
         if (cents === undefined && best.id) {
           const detail = new URL(`${this.baseUrl}/api/product`);

@@ -210,7 +210,9 @@ test('Pokémon TCG catalog maps cards, reuses known SKUs, and deduplicates daily
 
 test('PriceCharting selects Pokémon products and consumes integer cents from search or detail', async t => {
   const db = dbFor(t);
-  [graded, raw, sealed].forEach(sku => db.upsertSku(sku));
+  const psa10 = { ...graded, id: 'graded-psa10', grade: '10' };
+  const sgc10 = { ...psa10, id: 'sgc10', grader: 'SGC' } as const;
+  [graded, raw, sealed, psa10, sgc10].forEach(sku => db.upsertSku(sku));
   const syncer = new PriceChartingSyncer({
     apiToken: 'prices', rateLimiter: rateLimiter(),
     fetchFn: async input => {
@@ -226,16 +228,18 @@ test('PriceCharting selects Pokémon products and consumes integer cents from se
         { 'product-name': 'Other game', 'console-name': 'Pokemon', 'loose-price': 9 },
         isSealed ? { id: 'sealed', 'product-name': sealed.name, 'console-name': 'Pokémon Test Set' } : {
           'product-name': 'Pikachu ex #123', 'console-name': 'Pokémon Test Set', 'loose-price': 2531, 'graded-price': 6935,
+          'manual-only-price': 9050, 'condition-18-price': 7950,
         },
       ] });
     },
   });
-  const result = await syncer.sync(db, { nowIso, limit: 3 });
-  assert.deepEqual([result.compsInserted, result.errors], [3, []]);
-  assert.deepEqual([graded, raw, sealed].map(sku => db.getSoldComps(sku.id)[0].soldPriceCents), [6935, 2531, 12_345]);
+  const result = await syncer.sync(db, { nowIso, limit: 5 });
+  assert.deepEqual([result.compsInserted, result.errors], [4, []]);
+  assert.deepEqual([graded, psa10, raw, sealed].map(sku => db.getSoldComps(sku.id)[0].soldPriceCents), [6935, 9050, 2531, 12_345]);
+  assert.deepEqual(db.getSoldComps(sgc10.id), []);
   assert.equal(db.getSoldComps(sealed.id)[0].condition, 'SEALED');
   assert.equal(db.getSoldComps(raw.id)[0].source, 'pricecharting');
-  assert.equal((await syncer.sync(db, { nowIso, limit: 3 })).compsInserted, 0);
+  assert.equal((await syncer.sync(db, { nowIso, limit: 5 })).compsInserted, 0);
 });
 
 test('Insights parses USD sales, requires a matching SKU, and deduplicates by item ID', async t => {

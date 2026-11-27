@@ -29,9 +29,10 @@ const cleanListing = {
 const toolNames = [
   'get_system_state', 'set_operating_mode', 'set_kill_switch', 'run_scan_cycle', 'list_catalog_skus',
   'upsert_catalog_sku', 'evaluate_listing', 'list_decisions', 'list_orders', 'approve_hitl_order', 'reject_hitl_order',
-  'list_inventory', 'record_intake_qc', 'recommend_exit_channel', 'record_inventory_sale', 'list_audit_events',
+  'list_inventory', 'record_intake_qc', 'recommend_exit_channel', 'publish_inventory_listing', 'withdraw_inventory_listing',
+  'record_inventory_sale', 'list_audit_events',
   'get_buy_book', 'get_alpha_telemetry', 'ingest_webhook_listing', 'run_autonomous_triage', 'run_repricing_cycle',
-  'sync_market_data', 'check_readiness', 'bootstrap_catalog', 'run_autopilot_pass',
+  'import_sold_comps', 'sync_market_data', 'check_readiness', 'bootstrap_catalog', 'run_autopilot_pass',
 ];
 const resourceUris = ['state', 'hitl-queue', 'catalog', 'inventory', 'decisions/recent', 'audit/recent', 'buy-book', 'telemetry', 'readiness']
   .map(path => 'pokemon-arbitrage://' + path);
@@ -106,7 +107,7 @@ test('MCP negotiates protocol versions and handles lifecycle messages and JSON-R
   assertRpcError(batch[2], codes.METHOD_NOT_FOUND);
 });
 
-test('MCP exposes exactly 25 validated tools, 9 resources, and 5 prompts', async t => {
+test('MCP exposes exactly 28 validated tools, 9 resources, and 5 prompts', async t => {
   const { send, server } = setup(t);
   const { tools } = result<{ tools: McpToolDefinition[] }>(await send('tools/list'));
   assert.deepEqual(tools.map(tool => tool.name), toolNames);
@@ -431,15 +432,16 @@ test('spawned MCP stdio CLI flushes every JSON-RPC response at EOF with clean st
     request(2, 'tools/list'), toolCall(3, 'run_scan_cycle'), toolCall(4, 'get_system_state'),
     toolCall(5, 'ingest_webhook_listing', { ...cleanListing, listingId: 'stdio-push' }),
     toolCall(6, 'get_alpha_telemetry'), toolCall(7, 'check_readiness'),
+    toolCall(8, 'import_sold_comps', { csv: 'skuId,source,soldPriceUsd,soldAt\nsealed-ssp-bb,ebay,172.35,2026-11-26T11:00:00Z' }),
   ];
   child.stdin.end('\n{bad json}\n' + messages.map(message => JSON.stringify(message)).join('\n') + '\n');
   assert.deepEqual(await closed, [0, null], stderr);
   assert.ok(stdout.endsWith('\n'));
   const responses = stdout.slice(0, -1).split('\n').map(line => JSON.parse(line) as JsonRpcResponse);
-  assert.deepEqual(responses.map(response => response.id), [null, 1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(responses.map(response => response.id), [null, 1, 2, 3, 4, 5, 6, 7, 8]);
   assertRpcError(responses[0], codes.PARSE_ERROR);
   assert.equal(result<McpInitializeResult>(responses[1]).protocolVersion, '2025-03-26');
-  assert.equal(result<{ tools: McpToolDefinition[] }>(responses[2]).tools.length, 25);
+  assert.equal(result<{ tools: McpToolDefinition[] }>(responses[2]).tools.length, 28);
   const scan = result<McpToolCallResult>(responses[3]);
   assert.equal(scan.isError, undefined);
   assert.equal((scan.structuredContent?.summary as { fetchedCount: number }).fetchedCount, 17);
@@ -449,6 +451,33 @@ test('spawned MCP stdio CLI flushes every JSON-RPC response at EOF with clean st
   assert.equal((pushed.structuredContent?.decision as { action: string }).action, 'skip');
   assert.equal(result<McpToolCallResult>(responses[6]).structuredContent?.samplesCount, 1);
   assert.equal(result<McpToolCallResult>(responses[7]).structuredContent?.envFileLoaded, true);
+  assert.equal(result<McpToolCallResult>(responses[8]).structuredContent?.inserted, 1);
+});
+
+test('MCP imports historical comps and publishes and withdraws simulated inventory', async t => {
+  const { data, call, runtime } = setup(t, { mode: 'live' });
+  assertToolError(await call('import_sold_comps'), /Provide comps or csv/);
+  const soldAt = new Date().toISOString();
+  const comp = { skuId: 'sealed-ssp-bb', source: 'ebay', soldPriceCents: 16_789, soldAt };
+  assert.deepEqual(await data('import_sold_comps', {
+    comps: [comp, { ...comp, soldPriceCents: -1 }],
+    csv: `skuId,source,soldPriceCents,soldAt\nsealed-ssp-bb,ebay,16789,${soldAt}`,
+  }), {
+    received: 3, inserted: 1, duplicatesSkipped: 1, rejected: 1,
+    errors: ['Row 2: soldPriceCents must be a positive integer'],
+  });
+  await data('run_scan_cycle');
+  const item = runtime.db.listInventory().find(candidate => candidate.skuId === comp.skuId);
+  assert.ok(item);
+  await data('record_intake_qc', { inventoryId: item.id, passed: true, actualCondition: 'SEALED' });
+  const published = await data<{ item: InventoryItem }>('publish_inventory_listing', {
+    inventoryId: item.id, channel: 'ebay', listedPriceCents: 18_000,
+  });
+  assert.equal(published.item.externalOfferId, `sim-offer-${item.id}`);
+  assert.equal(published.item.listedPriceCents, 18_000);
+  const withdrawn = await data<{ item: InventoryItem }>('withdraw_inventory_listing', { inventoryId: item.id, reason: 'Review' });
+  assert.equal(withdrawn.item.status, 'qc_passed');
+  assert.equal(withdrawn.item.externalOfferId, undefined);
 });
 
 test('HTTP POST /mcp accepts requests, notifications, and batches on a loopback ephemeral port', async t => {

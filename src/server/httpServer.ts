@@ -10,9 +10,12 @@ import type { RawListing } from '../domain/types.ts';
 import type { AutopilotEngine } from '../engine/autopilot.ts';
 import { evaluateReadiness } from '../engine/readiness.ts';
 import { parseWebhookListing } from '../mcp/mcpServer.ts';
+import { InventoryListingError } from '../liquidation/inventoryManager.ts';
 import type { InventoryManager } from '../liquidation/inventoryManager.ts';
 import type { ArbitragePipeline } from '../pipeline/arbitragePipeline.ts';
 import type { MarketSyncCoordinator } from '../sync/marketSync.ts';
+import { importSoldComps, parseSoldCompsCsv } from '../sync/compImporter.ts';
+import type { ImportCompInput } from '../sync/compImporter.ts';
 import { FmvEngine } from '../valuation/fmvEngine.ts';
 
 export type McpHttpHandler = (
@@ -219,6 +222,23 @@ export function createArbitrageServer(options: ArbitrageServerOptions): Server {
           json(res, 200, await marketSync.syncAll({ limit, buyBook: autopilot?.getBuyBook(), fmvEngine, config }));
           return;
         }
+        case '/api/comps/import': {
+          const { comps, csv } = await readObject(req);
+          if (comps === undefined && csv === undefined) throw new HttpError(400, 'Provide comps or csv');
+          if (comps !== undefined && !Array.isArray(comps)) throw new HttpError(400, 'comps must be an array');
+          if (csv !== undefined && typeof csv !== 'string') throw new HttpError(400, 'csv must be a string');
+          let parsed: ImportCompInput[];
+          try {
+            parsed = csv === undefined ? [] : parseSoldCompsCsv(csv);
+          } catch (error) {
+            if (error instanceof SyntaxError) throw new HttpError(400, error.message);
+            throw error;
+          }
+          json(res, 200, importSoldComps(db, [...(comps ?? []), ...parsed], {
+            buyBook: autopilot?.getBuyBook(), fmvEngine, config,
+          }));
+          return;
+        }
         case '/api/webhooks/listing': {
           const engine = requireAutopilot();
           const { force, ...fields } = await readObject(req);
@@ -278,14 +298,27 @@ export function createArbitrageServer(options: ArbitrageServerOptions): Server {
         return;
       }
 
-      const inventoryAction = /^\/api\/inventory\/([^/]+)\/(qc|sell)$/.exec(pathname);
+      const inventoryAction = /^\/api\/inventory\/([^/]+)\/(qc|sell|publish|withdraw)$/.exec(pathname);
       if (inventoryAction) {
         const id = decodeId(inventoryAction[1]);
         const body = await readObject(req);
         const item = db.getInventoryItem(id);
         if (!item) throw new HttpError(404, 'Inventory item not found');
         if (item.status === 'sold') throw new HttpError(409, 'Inventory item is already sold');
-        if (inventoryAction[2] === 'qc') {
+        if (inventoryAction[2] === 'publish') {
+          const { imageUrls } = body;
+          if (imageUrls !== undefined && (!Array.isArray(imageUrls) || imageUrls.some(url => typeof url !== 'string'))) {
+            throw new HttpError(400, 'imageUrls must be an array of strings');
+          }
+          json(res, 200, await inventoryManager.publishListing(id, {
+            channel: body.channel === undefined ? undefined : choice(body.channel, ExitChannel, 'channel'),
+            listedPriceCents: body.listedPriceCents === undefined ? undefined : cents(body.listedPriceCents, 'listedPriceCents', 1),
+            title: optionalText(body.title, 'title'), description: optionalText(body.description, 'description'), imageUrls,
+            pushLive: body.pushLive === undefined ? undefined : boolean(body.pushLive, 'pushLive'),
+          }));
+        } else if (inventoryAction[2] === 'withdraw') {
+          json(res, 200, await inventoryManager.withdrawListing(id, optionalText(body.reason, 'reason')));
+        } else if (inventoryAction[2] === 'qc') {
           json(res, 200, inventoryManager.recordIntakeQc(id, {
             passed: boolean(body.passed, 'passed'),
             actualCondition: choice(body.actualCondition, CardCondition, 'actualCondition'),
@@ -310,7 +343,7 @@ export function createArbitrageServer(options: ArbitrageServerOptions): Server {
     void handle(req, res).catch((error: unknown) => {
       if (res.headersSent) {
         res.destroy();
-      } else if (error instanceof HttpError) {
+      } else if (error instanceof HttpError || error instanceof InventoryListingError) {
         json(res, error.status, { error: error.message });
       } else {
         console.error('Dashboard request failed', error);
