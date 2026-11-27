@@ -1,0 +1,19 @@
+{
+  "name": "pokemon-arbitrage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'test/**/*.test.ts'",
+    "demo": "node src/cli.ts demo",
+    "scan": "node src/cli.ts scan",
+    "serve": "node src/cli.ts serve",
+    "mcp": "node src/cli.ts mcp",
+    "autopilot": "node src/cli.ts autopilot"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "typescript": "^5.9.3"
+  }
+}

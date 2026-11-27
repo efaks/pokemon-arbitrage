@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Pokémon Arbitrage &amp; HITL Control Dashboard</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ground: #0c1017;
+      --surface: #141b26;
+      --raised: #1c2636;
+      --line: #2d394b;
+      --text: #eef3fa;
+      --muted: #adb9ca;
+      --accent: #9bedc5;
+      --warning: #ffd99c;
+      --danger: #ffaba9;
+      font: 16px/1.5 system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--ground); color: var(--text); }
+    button, select, input, textarea { font: inherit; }
+    button, select, input:not([type=checkbox]), textarea {
+      border: 1px solid var(--line); border-radius: .55rem; background: var(--raised);
+      color: var(--text); min-height: 2.65rem; padding: .45rem .75rem;
+    }
+    button, select { cursor: pointer; }
+    button:hover:not(:disabled), select:hover:not(:disabled) { border-color: var(--muted); }
+    button:disabled { cursor: default; opacity: .5; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    a { color: var(--accent); }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(1.35rem, 3vw, 2.1rem); letter-spacing: -.035em; line-height: 1.2; }
+    h2 { font-size: 1.35rem; }
+    h3 { font-size: 1.15rem; }
+    header { border-bottom: 1px solid var(--line); background: var(--surface); }
+    .wrap { width: min(90rem, 100% - 3rem); margin-inline: auto; }
+    .masthead, .controls, .section-head, .actions, .flags {
+      display: flex; flex-wrap: wrap; gap: .65rem; align-items: center;
+    }
+    .masthead { justify-content: space-between; gap: 1.25rem; padding-block: 1.35rem; }
+    .controls label { display: flex; align-items: center; gap: .5rem; color: var(--muted); }
+    .primary { background: var(--accent); color: #10291e; border-color: transparent; font-weight: 700; }
+    .danger { color: var(--danger); }
+    .muted, .label { color: var(--muted); }
+    .label { font-size: .875rem; }
+    .badge {
+      display: inline-flex; align-items: center; gap: .4rem; max-width: 100%;
+      background: var(--raised); border: 1px solid var(--line); border-radius: 99rem;
+      padding: .2rem .6rem; font-size: .875rem; color: var(--muted);
+    }
+    .badge.good { color: var(--accent); border-color: #426d59; }
+    .badge.warn { color: var(--warning); border-color: #836637; }
+    .badge.danger { color: var(--danger); border-color: #834948; }
+    .dot::before { content: ""; width: .48rem; height: .48rem; border-radius: 50%; background: currentColor; }
+    main { padding-block: 1.5rem 3rem; }
+    .feedback { min-height: 1.5rem; margin-bottom: .75rem; color: var(--muted); }
+    .feedback.error { color: var(--danger); }
+    .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: .8rem; margin: 0 0 1.5rem; }
+    .kpis div, .card, .table-frame, .empty { border: 1px solid var(--line); background: var(--surface); border-radius: .8rem; }
+    .kpis div { padding: 1rem; }
+    .kpis dd { margin: .25rem 0 0; font-size: clamp(1rem, 2vw, 1.4rem); font-weight: 650; }
+    .kpis dd, .amount { font-variant-numeric: tabular-nums; }
+    .tabbar { display: flex; gap: .4rem; border-bottom: 1px solid var(--line); overflow-x: auto; margin-bottom: 1.2rem; }
+    .tabbar button {
+      border-radius: 0; border: 0; border-bottom: 2px solid transparent; background: none;
+      white-space: nowrap; color: var(--muted); min-height: 3rem;
+    }
+    .tabbar button[aria-selected=true] { border-bottom-color: var(--accent); color: var(--accent); }
+    .section-head { justify-content: space-between; margin-bottom: .9rem; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 25rem), 1fr)); gap: .9rem; }
+    .card { display: flex; flex-direction: column; gap: .9rem; padding: 1rem; min-width: 0; }
+    .card-title { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: .4rem; }
+    .numbers { display: grid; grid-template-columns: repeat(3, 1fr); gap: .55rem; margin: 0; padding: .65rem 0; border-block: 1px solid var(--line); }
+    .numbers dd { margin: 0; font-weight: 650; }
+    .warning {
+      display: grid; gap: .45rem; padding: .7rem .8rem; color: var(--warning);
+      border-radius: .55rem; border: 1px solid #836637; background: #302516;
+    }
+    .warning label { display: flex; align-items: start; gap: .5rem; }
+    input[type=checkbox] { accent-color: var(--accent); margin: .35rem 0 0; }
+    .card .actions { margin-top: auto; }
+    .card .actions a { margin-right: auto; }
+    .flags { gap: .35rem; }
+    .filter { min-height: 2.2rem; border-radius: 99rem; }
+    .filter[aria-pressed=true] { color: var(--accent); border-color: #679f83; }
+    .table-frame { overflow: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    th, td { padding: .75rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { background: var(--raised); color: var(--muted); white-space: nowrap; font-size: .875rem; }
+    tbody tr:last-child td { border-bottom: 0; }
+    td.amount { white-space: nowrap; }
+    td p + p { margin-top: .3rem; }
+    td .actions { min-width: 14rem; }
+    td .actions button { min-height: 2.2rem; font-size: .875rem; }
+    .empty { padding: 1.3rem; color: var(--muted); }
+    dialog {
+      width: min(32rem, calc(100% - 2rem)); max-height: calc(100% - 2rem); padding: 1.25rem;
+      background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: .85rem;
+    }
+    dialog::backdrop { background: #03060acc; }
+    form, #dialog-fields { display: grid; gap: .85rem; }
+    #dialog-fields label { display: grid; gap: .25rem; }
+    #dialog-error { color: var(--danger); }
+    dialog .actions { justify-content: end; }
+    @media (max-width: 62rem) { .kpis { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 36rem) {
+      .wrap { width: calc(100% - 1.5rem); }
+      .masthead { align-items: flex-start; }
+      .kpis div { padding: .75rem; }
+      .kpis dd { overflow-wrap: anywhere; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap masthead">
+      <h1>Pokémon Arbitrage &amp; HITL Control Dashboard</h1>
+      <div class="controls">
+        <span class="badge dot" id="kill-status">Kill switch · Connecting</span>
+        <button id="kill-toggle" disabled>Engage</button>
+        <label>Operating mode
+          <select id="mode" disabled><option value="shadow">Shadow</option><option value="hitl">HITL</option><option value="live">Live</option></select>
+        </label>
+        <button class="primary" id="scan" disabled>Run Scan Cycle</button>
+      </div>
+    </div>
+  </header>
+  <main class="wrap">
+    <p class="feedback" id="feedback" role="status" aria-live="polite">Connecting to the dashboard…</p>
+    <dl class="kpis">
+      <div><dt class="label">Daily spend / cap</dt><dd id="spend">—</dd></div>
+      <div><dt class="label">Pending HITL</dt><dd id="pending">—</dd></div>
+      <div><dt class="label">Active inventory cost basis</dt><dd id="basis">—</dd></div>
+      <div><dt class="label">Predicted / realized P&amp;L</dt><dd id="pnl">—</dd></div>
+    </dl>
+    <div class="tabbar" role="tablist" aria-label="Dashboard views">
+      <button role="tab" id="queue-tab" aria-selected="true" aria-controls="queue-panel">HITL Queue</button>
+      <button role="tab" id="decisions-tab" aria-selected="false" aria-controls="decisions-panel" tabindex="-1">Decisions Feed</button>
+      <button role="tab" id="inventory-tab" aria-selected="false" aria-controls="inventory-panel" tabindex="-1">Inventory &amp; Liquidation</button>
+    </div>
+    <section role="tabpanel" id="queue-panel" aria-labelledby="queue-tab">
+      <div class="section-head"><h2>Orders awaiting review</h2></div>
+      <div id="queue" class="cards"></div>
+    </section>
+    <section role="tabpanel" id="decisions-panel" aria-labelledby="decisions-tab" hidden>
+      <div class="section-head">
+        <h2>Recent decisions</h2>
+        <div class="actions" id="filters" aria-label="Filter by decision">
+          <button class="filter" data-filter="all" aria-pressed="true">All</button>
+          <button class="filter" data-filter="auto_buy" aria-pressed="false">Auto-buy</button>
+          <button class="filter" data-filter="hitl_review" aria-pressed="false">HITL review</button>
+          <button class="filter" data-filter="skip" aria-pressed="false">Skip</button>
+        </div>
+      </div>
+      <div id="decisions"></div>
+    </section>
+    <section role="tabpanel" id="inventory-panel" aria-labelledby="inventory-tab" hidden>
+      <div class="section-head"><h2>Acquired items</h2></div>
+      <div id="inventory"></div>
+    </section>
+  </main>
+  <dialog id="record-dialog" aria-labelledby="dialog-title">
+    <form id="record-form">
+      <h2 id="dialog-title"></h2>
+      <div id="dialog-fields"></div>
+      <p id="dialog-error" role="alert" hidden></p>
+      <div class="actions"><button id="dialog-close" type="button">Close</button><button class="primary" id="dialog-save" type="submit">Save</button></div>
+    </form>
+  </dialog>
+  <script>
+    const get = id => document.getElementById(id);
+    const dollars = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+    const percentage = new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 1 });
+    const money = cents => cents == null ? '—' : dollars.format(cents / 100);
+    const ratio = value => value == null ? '—' : percentage.format(value);
+    const conditions = ['SEALED', 'NM', 'LP', 'MP', 'HP', 'DMG'];
+    const channels = { ebay: 'eBay', tcgplayer: 'TCGplayer', cardmarket: 'Cardmarket', buylist: 'Buylist' };
+    const statuses = { in_transit: 'In transit', qc_passed: 'QC passed', qc_disputed: 'QC disputed', listed: 'Listed', sold: 'Sold' };
+    const decisionNames = { auto_buy: 'Auto-buy', hitl_review: 'HITL review', skip: 'Skip' };
+    const tones = { auto_buy: 'good', hitl_review: 'warn', qc_disputed: 'danger', qc_passed: 'good', sold: 'good' };
+    let systemState;
+    let decisions = [];
+    let filter = 'all';
+    let busy = false;
+    let killBusy = false;
+    let dialogAction;
+    let dialogSaving = false;
+
+    function el(tag, content, className) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (content != null) node.append(...(Array.isArray(content) ? content : [content]));
+      return node;
+    }
+
+    function button(label, action, className) {
+      const node = el('button', label, className);
+      node.type = 'button';
+      node.addEventListener('click', action);
+      return node;
+    }
+
+    function listingLink(url) {
+      try {
+        const parsed = new URL(url);
+        if (!['http:', 'https:'].includes(parsed.protocol)) return '';
+        const link = el('a', 'Open listing');
+        link.href = parsed.href;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        return link;
+      } catch {
+        return '';
+      }
+    }
+
+    async function api(path, data) {
+      const response = await fetch(path, data === undefined ? undefined : {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || 'Request failed (' + response.status + ')');
+      return body;
+    }
+
+    function feedback(message, isError = false) {
+      get('feedback').textContent = message;
+      get('feedback').classList.toggle('error', isError);
+    }
+
+    function renderState(metrics) {
+      systemState = metrics.systemState;
+      const engaged = systemState.killSwitchEngaged;
+      const pill = get('kill-status');
+      pill.textContent = 'Kill switch · ' + (engaged ? 'Engaged' : 'Clear');
+      pill.className = 'badge dot ' + (engaged ? 'danger' : 'good');
+      pill.title = systemState.killSwitchReason || '';
+      get('kill-toggle').textContent = engaged ? 'Release' : 'Engage';
+      get('mode').value = systemState.operatingMode;
+      get('spend').textContent = money(metrics.portfolio.dailySpendCents) + ' / ' + money(metrics.portfolio.dailySpendCapCents);
+      get('pending').textContent = String(metrics.pendingHitlCount);
+      get('basis').textContent = money(metrics.portfolio.activeInventoryCostCents);
+      get('pnl').textContent = money(metrics.totalPredictedProfitCents) + ' / ' + money(metrics.totalRealizedProfitCents);
+      for (const id of ['mode', 'scan']) get(id).disabled = busy;
+      get('kill-toggle').disabled = killBusy;
+    }
+
+    async function refresh() {
+      const [metrics, orders, feed, items] = await Promise.all([
+        api('/api/state'), api('/api/orders?status=pending_hitl'), api('/api/decisions'), api('/api/inventory'),
+      ]);
+      decisions = feed;
+      renderState(metrics);
+      renderQueue(orders);
+      renderDecisions();
+      renderInventory(items);
+    }
+
+    async function perform(action, describe) {
+      if (busy) return;
+      busy = true;
+      for (const id of ['mode', 'scan']) get(id).disabled = true;
+      let message;
+      let failed = false;
+      try {
+        message = describe(await action());
+      } catch (error) {
+        message = error.message;
+        failed = true;
+      }
+      busy = false;
+      try {
+        await refresh();
+      } catch (error) {
+        message += ' Refresh failed. ' + error.message;
+        failed = true;
+        for (const id of ['mode', 'scan']) get(id).disabled = !systemState;
+      }
+      feedback(message, failed);
+    }
+
+    function numbers(details) {
+      return el('dl', details.map(([label, value]) => el('div', [
+        el('dt', label, 'label'), el('dd', value, 'amount'),
+      ])), 'numbers');
+    }
+
+    function renderQueue(orders) {
+      const byId = new Map(decisions.map(decision => [decision.id, decision]));
+      get('queue').replaceChildren(...(orders.length ? orders.map(order => {
+        const decision = byId.get(order.decisionId);
+        const warnings = order.decisionWarnings;
+        const anomalous = decision?.anomalyFlagged || warnings.some(warning => /anomaly/i.test(warning));
+        const checkbox = el('input');
+        checkbox.type = 'checkbox';
+        const approve = button('Approve', () => perform(
+          () => api('/api/orders/' + encodeURIComponent(order.id) + '/approve', { confirmAnomaly: checkbox.checked }),
+          outcome => 'Filled ' + outcome.order.skuName + '.',
+        ), 'primary');
+        if (anomalous) {
+          approve.disabled = true;
+          checkbox.addEventListener('change', () => { approve.disabled = !checkbox.checked; });
+        }
+        const reject = button('Reject', () => {
+          const reason = prompt('Rejection reason', 'Rejected by operator');
+          if (reason === null) return;
+          void perform(() => api('/api/orders/' + encodeURIComponent(order.id) + '/reject', { reason }),
+            result => 'Rejected ' + result.skuName + '.');
+        }, 'danger');
+        const children = [
+          el('div', [el('h3', order.skuName), el('span', 'Match ' + ratio(decision?.matchConfidence), 'badge')], 'card-title'),
+          el('p', order.listingTitle, 'muted'),
+          numbers([
+            ['Landed cost', money(order.landedCostCents)], ['Expected profit', money(order.expectedNetProfitCents)],
+            ['Expected ROI', ratio(order.expectedNetRoi)],
+          ]),
+        ];
+        if (warnings.length) children.push(el('div', warnings.map(warning => el('span', warning, 'badge warn')), 'flags'));
+        else if (decision?.reasons.length) children.push(el('p', decision.reasons.at(-1), 'muted'));
+        if (anomalous) children.push(el('div', [
+          el('strong', 'Anomaly flagged'),
+          el('label', [checkbox, 'I checked the listing and explicitly approve the flagged discount.']),
+        ], 'warning'));
+        children.push(el('div', [listingLink(order.listingUrl), reject, approve], 'actions'));
+        return el('article', children, 'card');
+      }) : [el('p', 'No orders are awaiting review.', 'empty')]));
+    }
+
+    function table(container, headings, rows, empty) {
+      if (!rows.length) {
+        container.replaceChildren(el('p', empty, 'empty'));
+        return;
+      }
+      const head = el('thead', el('tr', headings.map(label => {
+        const cell = el('th', label);
+        cell.scope = 'col';
+        return cell;
+      })));
+      container.replaceChildren(el('div', el('table', [head, el('tbody', rows.map(row => el('tr', row)))]), 'table-frame'));
+    }
+
+    function renderDecisions() {
+      const filtered = decisions.filter(decision => filter === 'all' || decision.action === filter);
+      table(get('decisions'), ['Action', 'Listing / SKU', 'FMV', 'Profit / ROI', 'Warnings', 'Primary reason'], filtered.map(decision => [
+        el('td', el('span', decisionNames[decision.action], 'badge ' + (tones[decision.action] || ''))),
+        el('td', [el('strong', decision.skuName || decision.listingTitle),
+          ...(decision.skuName ? [el('p', decision.listingTitle, 'label')] : [])]),
+        el('td', money(decision.fmvCents), 'amount'),
+        el('td', money(decision.bestExit?.netProfitCents) + ' / ' + ratio(decision.bestExit?.netRoi), 'amount'),
+        el('td', decision.warnings.length ? decision.warnings.map(warning => el('p', warning)) : '—'),
+        el('td', decision.reasons[0] || '—'),
+      ]), 'No decisions match this view.');
+    }
+
+    function renderInventory(items) {
+      table(get('inventory'), ['Item', 'Condition', 'Status', 'Cost basis', 'Predicted / realized profit', 'Actions'], items.map(item => {
+        const itemActions = item.status === 'sold' ? [] : [
+          button('QC pass', () => showQc(item, true)),
+          button('QC dispute', () => showQc(item, false), 'danger'),
+          button('Record sale', () => showSale(item)),
+          button('Recommend exit', () => void showExit(item)),
+        ];
+        return [
+          el('td', [el('strong', item.skuName), el('p', item.skuId, 'label')]),
+          el('td', item.actualCondition || item.expectedCondition),
+          el('td', el('span', statuses[item.status], 'badge ' + (tones[item.status] || ''))),
+          el('td', money(item.costBasisCents), 'amount'),
+          el('td', money(item.predictedNetProfitCents) + ' / ' + money(item.realizedProfitCents), 'amount'),
+          el('td', itemActions.length ? el('div', itemActions, 'actions') : '—'),
+        ];
+      }), 'Inventory will appear after the first order fills.');
+    }
+
+    function select(entries, value) {
+      const field = el('select', entries.map(([key, label]) => {
+        const option = el('option', label);
+        option.value = key;
+        return option;
+      }));
+      field.value = value;
+      return field;
+    }
+
+    function showDialog(title, fields, action, submitLabel) {
+      const dialog = get('record-dialog');
+      if (dialog.open) return;
+      get('dialog-title').textContent = title;
+      get('dialog-fields').replaceChildren(...fields);
+      get('dialog-error').hidden = true;
+      get('dialog-save').hidden = !action;
+      get('dialog-save').textContent = submitLabel || 'Save';
+      dialogAction = action;
+      dialog.showModal();
+    }
+
+    function showQc(item, passed) {
+      const condition = select(conditions.map(value => [value, value]), item.actualCondition || item.expectedCondition);
+      const notes = el('textarea');
+      notes.value = item.qcNotes || '';
+      showDialog(passed ? 'Pass intake QC' : 'Dispute intake QC', [
+        el('p', item.skuName), el('label', ['Actual condition', condition]), el('label', ['Notes (optional)', notes]),
+      ], async () => {
+        const updated = await api('/api/inventory/' + encodeURIComponent(item.id) + '/qc', {
+          passed, actualCondition: condition.value, notes: notes.value,
+        });
+        return updated.skuName + ' · ' + statuses[updated.status] + '.';
+      }, 'Record QC');
+    }
+
+    function centsField(minimum, required) {
+      const input = el('input');
+      input.type = 'number';
+      input.min = String(minimum);
+      input.max = String(Number.MAX_SAFE_INTEGER);
+      input.step = '1';
+      input.required = required;
+      return input;
+    }
+
+    function showSale(item) {
+      const channel = select(Object.entries(channels), item.expectedExitChannel);
+      const price = centsField(1, true);
+      const fees = centsField(0, false);
+      showDialog('Record sale', [
+        el('p', item.skuName), el('label', ['Exit channel', channel]), el('label', ['Sale price (USD cents)', price]),
+        el('label', ['Exit costs (USD cents, optional)', fees]),
+      ], async () => {
+        const body = { exitChannel: channel.value, soldPriceCents: price.valueAsNumber };
+        if (fees.value !== '') body.exitFeesCents = fees.valueAsNumber;
+        const sold = await api('/api/inventory/' + encodeURIComponent(item.id) + '/sell', body);
+        return 'Recorded sale for ' + sold.skuName + '. Realized profit ' + money(sold.realizedProfitCents) + '.';
+      }, 'Record sale');
+    }
+
+    async function showExit(item) {
+      try {
+        const exit = await api('/api/inventory/' + encodeURIComponent(item.id) + '/recommend-exit');
+        showDialog('Recommended exit · ' + channels[exit.recommendedChannel], [
+          el('p', item.skuName), el('p', exit.rationale, 'muted'),
+          numbers([['FMV', money(exit.expectedFmvCents)], ['Net proceeds', money(exit.expectedNetProceedsCents)],
+            ['Net profit', money(exit.expectedNetProfitCents)]]),
+        ]);
+      } catch (error) {
+        feedback(error.message, true);
+      }
+    }
+
+    const tabs = Array.from(document.querySelectorAll('[role=tab]'));
+    function selectTab(selected) {
+      for (const tab of tabs) {
+        const active = tab === selected;
+        tab.setAttribute('aria-selected', String(active));
+        tab.tabIndex = active ? 0 : -1;
+        get(tab.getAttribute('aria-controls')).hidden = !active;
+      }
+      selected.focus();
+    }
+    tabs.forEach((tab, index) => {
+      tab.addEventListener('click', () => selectTab(tab));
+      tab.addEventListener('keydown', event => {
+        const next = { ArrowLeft: (index + tabs.length - 1) % tabs.length, ArrowRight: (index + 1) % tabs.length,
+          Home: 0, End: tabs.length - 1 }[event.key];
+        if (next === undefined) return;
+        event.preventDefault();
+        selectTab(tabs[next]);
+      });
+    });
+    get('filters').addEventListener('click', event => {
+      if (!event.target.dataset.filter) return;
+      filter = event.target.dataset.filter;
+      for (const chip of get('filters').children) chip.setAttribute('aria-pressed', String(chip.dataset.filter === filter));
+      renderDecisions();
+    });
+    get('scan').addEventListener('click', () => {
+      feedback('Scanning enabled connectors…');
+      void perform(() => api('/api/scan', {}), cycle =>
+        'Scan complete. ' + cycle.fetchedCount + ' fetched, ' + cycle.hitlQueuedCount + ' queued, ' +
+        cycle.autoBoughtCount + ' filled, ' + cycle.errorCount + ' errors.');
+    });
+    get('kill-toggle').addEventListener('click', async () => {
+      const engaged = !systemState.killSwitchEngaged;
+      killBusy = true;
+      get('kill-toggle').disabled = true;
+      try {
+        await api('/api/kill-switch', { engaged, reason: 'Dashboard operator' });
+        await refresh();
+        feedback('Kill switch ' + (engaged ? 'engaged.' : 'released.'));
+      } catch (error) {
+        feedback(error.message, true);
+      } finally {
+        killBusy = false;
+        get('kill-toggle').disabled = false;
+      }
+    });
+    get('mode').addEventListener('change', event => {
+      const mode = event.target.value;
+      void perform(() => api('/api/mode', { mode }), () => 'Operating mode changed to ' + mode + '.');
+    });
+    get('dialog-close').addEventListener('click', () => get('record-dialog').close());
+    get('record-dialog').addEventListener('cancel', event => { if (dialogSaving) event.preventDefault(); });
+    get('record-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      if (!dialogAction || dialogSaving) return;
+      const errorNode = get('dialog-error');
+      errorNode.hidden = true;
+      dialogSaving = true;
+      for (const id of ['dialog-close', 'dialog-save']) get(id).disabled = true;
+      try {
+        const message = await dialogAction();
+        get('record-dialog').close();
+        try {
+          await refresh();
+          feedback(message);
+        } catch (error) {
+          feedback(message + ' Refresh failed. ' + error.message, true);
+        }
+      } catch (error) {
+        errorNode.textContent = error.message;
+        errorNode.hidden = false;
+      } finally {
+        dialogSaving = false;
+        for (const id of ['dialog-close', 'dialog-save']) get(id).disabled = false;
+      }
+    });
+    refresh().then(() => feedback(''), error => feedback(error.message, true));
+    setInterval(async () => {
+      if (busy || killBusy || dialogSaving || document.hidden) return;
+      try {
+        const metrics = await api('/api/state');
+        if (busy || killBusy || dialogSaving) return;
+        if (metrics.systemState.lastScanAt !== systemState?.lastScanAt && !get('record-dialog').open) {
+          await refresh();
+        } else {
+          renderState(metrics);
+        }
+      } catch (error) {
+        if (!busy) feedback(error.message, true);
+      }
+    }, 5000);
+  </script>
+</body>
+</html>
