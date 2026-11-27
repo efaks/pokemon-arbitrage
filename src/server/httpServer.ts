@@ -10,6 +10,8 @@ import type { AutopilotEngine } from '../engine/autopilot.ts';
 import { parseWebhookListing } from '../mcp/mcpServer.ts';
 import type { InventoryManager } from '../liquidation/inventoryManager.ts';
 import type { ArbitragePipeline } from '../pipeline/arbitragePipeline.ts';
+import type { MarketSyncCoordinator } from '../sync/marketSync.ts';
+import { FmvEngine } from '../valuation/fmvEngine.ts';
 
 export type McpHttpHandler = (
   payload: unknown, reqHeaders?: Record<string, string | string[] | undefined>,
@@ -22,6 +24,8 @@ export interface ArbitrageServerOptions {
   config: ArbitrageConfig;
   mcpHandler?: McpHttpHandler;
   autopilot?: AutopilotEngine;
+  marketSync?: MarketSyncCoordinator;
+  fmvEngine?: FmvEngine;
   publicDir?: string;
 }
 
@@ -105,7 +109,8 @@ function decodeId(value: string): string {
 }
 
 export function createArbitrageServer(options: ArbitrageServerOptions): Server {
-  const { pipeline, db, inventoryManager, config, publicDir, mcpHandler, autopilot } = options;
+  const { pipeline, db, inventoryManager, config, publicDir, mcpHandler, autopilot, marketSync } = options;
+  const fmvEngine = options.fmvEngine ?? new FmvEngine();
   const indexPath = publicDir === undefined ? defaultIndex : resolve(publicDir, 'index.html');
 
   const requireAutopilot = () => {
@@ -200,6 +205,15 @@ export function createArbitrageServer(options: ArbitrageServerOptions): Server {
           await readObject(req);
           json(res, 200, await pipeline.runCycle());
           return;
+        case '/api/sync': {
+          if (!marketSync) throw new HttpError(501, 'Market sync coordinator not attached');
+          const { limit } = await readObject(req);
+          if (limit !== undefined && (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1)) {
+            throw new HttpError(400, 'limit must be a positive integer');
+          }
+          json(res, 200, await marketSync.syncAll({ limit, buyBook: autopilot?.getBuyBook(), fmvEngine, config }));
+          return;
+        }
         case '/api/webhooks/listing': {
           const engine = requireAutopilot();
           const { force, ...fields } = await readObject(req);

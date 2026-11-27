@@ -175,7 +175,7 @@ export interface MatchResult {
 export interface SoldComp {
   id: string;
   skuId: string;
-  source: SourceName;
+  source: SourceName | 'pricecharting';
   soldPriceCents: number;
   shippingCents: number;
   totalPriceCents: number;

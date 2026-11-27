@@ -49,6 +49,30 @@ export class ConsoleNotifier implements AlertNotifier {
   }
 }
 
+export class CompositeNotifier implements AlertNotifier {
+  private readonly notifiers: AlertNotifier[];
+
+  constructor(notifiers: AlertNotifier[]) {
+    this.notifiers = [...notifiers];
+  }
+
+  private async notify(send: (notifier: AlertNotifier) => void | Promise<void>): Promise<void> {
+    await Promise.allSettled(this.notifiers.map(async notifier => send(notifier)));
+  }
+
+  notifyDecision(decision: ArbitrageDecision): Promise<void> {
+    return this.notify(notifier => notifier.notifyDecision(decision));
+  }
+
+  notifyOrder(order: PurchaseOrder, event: string): Promise<void> {
+    return this.notify(notifier => notifier.notifyOrder(order, event));
+  }
+
+  notifyCircuitBreaker(reason: string): Promise<void> {
+    return this.notify(notifier => notifier.notifyCircuitBreaker(reason));
+  }
+}
+
 export class WebhookNotifier implements AlertNotifier {
   private readonly webhookUrl?: string;
   private readonly fetchFn: FetchLike;

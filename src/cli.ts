@@ -20,11 +20,13 @@ import { EbayOrderApiExecutor, ExecutionCoordinator, SimulatedApiExecutor } from
 import { InventoryManager } from './liquidation/inventoryManager.ts';
 import { MockCertVerifier, PsaHttpCertVerifier } from './matching/certVerifier.ts';
 import { EntityResolver } from './matching/entityResolver.ts';
+import { HeuristicVisionVerifier, OpenAICompatibleVisionVerifier } from './matching/visionVerifier.ts';
 import { ArbitrageMcpServer } from './mcp/mcpServer.ts';
 import { StdioMcpTransport } from './mcp/stdioTransport.ts';
-import { ConsoleNotifier, NullNotifier } from './notifications/notifier.ts';
+import { CompositeNotifier, ConsoleNotifier, NullNotifier, WebhookNotifier } from './notifications/notifier.ts';
 import { ArbitragePipeline } from './pipeline/arbitragePipeline.ts';
 import { createArbitrageServer } from './server/httpServer.ts';
+import { EbaySoldCompsSyncer, MarketSyncCoordinator, PokemonTcgApiCatalogSyncer, PriceChartingSyncer } from './sync/marketSync.ts';
 import { FmvEngine } from './valuation/fmvEngine.ts';
 
 export interface SystemRuntimeOptions {
@@ -52,6 +54,7 @@ export interface SystemRuntime {
   inventoryManager: InventoryManager;
   pipeline: ArbitragePipeline;
   connectors: SupplyConnector[];
+  marketSync: MarketSyncCoordinator;
 }
 
 export function createSystemRuntime(options: SystemRuntimeOptions = {}): SystemRuntime {
@@ -75,17 +78,26 @@ export function createSystemRuntime(options: SystemRuntimeOptions = {}): SystemR
         new ShopifyStorefrontConnector(), new TcgplayerFeedConnector(),
       ];
     const certVerifier = options.useMock ? new MockCertVerifier() : new PsaHttpCertVerifier();
-    const resolver = new EntityResolver({ config, certVerifier });
+    const visionVerifier = !options.useMock && process.env.VISION_API_KEY?.trim() && process.env.VISION_API_URL?.trim()
+      ? new OpenAICompatibleVisionVerifier() : new HeuristicVisionVerifier();
+    const resolver = new EntityResolver({ config, certVerifier, visionVerifier });
     const fmvEngine = new FmvEngine();
     const riskEngine = new RiskEngine();
     // The coordinator checks the persisted mode. Keep the real adapter ready for dashboard mode changes.
     const adapter = options.useMock ? new SimulatedApiExecutor(options.simulationOverrides) : new EbayOrderApiExecutor();
     const executor = new ExecutionCoordinator({ db, config, adapter });
     const inventoryManager = new InventoryManager(db, fmvEngine, config);
-    const notifier = options.quiet ? new NullNotifier() : new ConsoleNotifier();
+    const notifier = !options.useMock && process.env.ARBITRAGE_WEBHOOK_URL?.trim()
+      ? new CompositeNotifier([new WebhookNotifier(), ...(options.quiet ? [] : [new ConsoleNotifier()])])
+      : options.quiet ? new NullNotifier() : new ConsoleNotifier();
     const pipeline = new ArbitragePipeline({ db, config, connectors, resolver, fmvEngine, riskEngine, executor, notifier });
+    const marketSync = new MarketSyncCoordinator(db, [
+      new PokemonTcgApiCatalogSyncer(options.useMock ? { apiKey: '' } : undefined),
+      new PriceChartingSyncer(options.useMock ? { apiToken: '' } : undefined),
+      new EbaySoldCompsSyncer(options.useMock ? { enabled: false } : undefined),
+    ]);
 
-    return { db, config, resolver, fmvEngine, riskEngine, executor, inventoryManager, pipeline, connectors };
+    return { db, config, resolver, fmvEngine, riskEngine, executor, inventoryManager, pipeline, connectors, marketSync };
   } catch (error) {
     db.close();
     throw error;
@@ -170,8 +182,9 @@ const usage = `Usage: node src/cli.ts <command>
   scan  [--mode shadow|hitl|live] [--db data/arbitrage.sqlite] [--mock]
   serve [--port 3000] [--mode hitl] [--db data/arbitrage.sqlite] [--mock] [--poll-ms 0]
   mcp   [--mode shadow|hitl|live] [--db data/arbitrage.sqlite] [--mock]
+  sync  [--db data/arbitrage.sqlite] [--limit 50]
   autopilot [--mode live|hitl|shadow] [--db data/arbitrage.sqlite] [--mock] [--once]
-            [--hot-ms 5000] [--standard-ms 30000] [--reprice-ms 60000]`;
+            [--hot-ms 5000] [--standard-ms 30000] [--reprice-ms 60000] [--sync-ms milliseconds]`;
 
 function integerOption(value: string, label: string, max: number): number {
   const number = Number(value);
@@ -188,7 +201,9 @@ async function main(args: string[]): Promise<void> {
     return;
   }
   if (command === 'demo' && flags.length === 0) return demo();
-  if (command !== 'scan' && command !== 'serve' && command !== 'mcp' && command !== 'autopilot') throw new Error(usage);
+  if (command !== 'scan' && command !== 'serve' && command !== 'mcp' && command !== 'autopilot' && command !== 'sync') {
+    throw new Error(usage);
+  }
 
   const { values } = parseArgs({
     args: flags,
@@ -196,17 +211,32 @@ async function main(args: string[]): Promise<void> {
       mode: { type: 'string' }, db: { type: 'string' }, mock: { type: 'boolean' },
       port: { type: 'string' }, 'poll-ms': { type: 'string' },
       once: { type: 'boolean' }, 'hot-ms': { type: 'string' }, 'standard-ms': { type: 'string' }, 'reprice-ms': { type: 'string' },
+      'sync-ms': { type: 'string' }, limit: { type: 'string' },
     },
   });
   const mode = Object.values(OperatingMode).find(candidate => candidate === values.mode);
   if (values.mode !== undefined && mode === undefined) throw new Error('--mode must be shadow, hitl, or live');
   if (command !== 'serve' && (values.port !== undefined || values['poll-ms'] !== undefined)) throw new Error(usage);
 
-  if (command !== 'autopilot' && [values.once, values['hot-ms'], values['standard-ms'], values['reprice-ms']]
+  if (command !== 'autopilot' && [values.once, values['hot-ms'], values['standard-ms'], values['reprice-ms'], values['sync-ms']]
     .some(value => value !== undefined)) throw new Error(usage);
+  if (command !== 'sync' && values.limit !== undefined) throw new Error(usage);
+
+  if (command === 'sync') {
+    if (mode !== undefined || values.mock !== undefined) throw new Error(usage);
+    const limit = integerOption(values.limit ?? '50', 'limit', Number.MAX_SAFE_INTEGER);
+    if (limit === 0) throw new Error('--limit must be a positive integer');
+    const { db, marketSync } = createSystemRuntime({ dbPath: values.db, quiet: true });
+    try {
+      console.log(JSON.stringify(await marketSync.syncAll({ limit }), null, 2));
+    } finally {
+      db.close();
+    }
+    return;
+  }
 
   if (command === 'autopilot') {
-    const interval = (flag: 'hot-ms' | 'standard-ms' | 'reprice-ms', fallback: string) => {
+    const interval = (flag: 'hot-ms' | 'standard-ms' | 'reprice-ms' | 'sync-ms', fallback: string) => {
       const ms = integerOption(values[flag] ?? fallback, flag, 2_147_483_647);
       if (ms === 0) throw new Error(`--${flag} must be at least 1 millisecond`);
       return ms;
@@ -214,13 +244,14 @@ async function main(args: string[]): Promise<void> {
     const hotIntervalMs = interval('hot-ms', '5000');
     const standardIntervalMs = interval('standard-ms', '30000');
     const repriceIntervalMs = interval('reprice-ms', '60000');
+    const syncIntervalMs = values['sync-ms'] === undefined ? undefined : interval('sync-ms', '');
     const runtime = createSystemRuntime({ dbPath: values.db, mode, useMock: values.mock, quiet: values.once === true });
     const autopilot = new AutopilotEngine(runtime);
     try {
       if (values.once) {
         printAutopilot(await autopilot.runAutopilotPass());
       } else {
-        autopilot.startDaemon({ hotIntervalMs, standardIntervalMs, repriceIntervalMs });
+        autopilot.startDaemon({ hotIntervalMs, standardIntervalMs, repriceIntervalMs, syncIntervalMs });
         console.log(`Autopilot running in ${runtime.db.getSystemState().operatingMode} mode`);
         let finish!: () => void;
         const stopped = new Promise<void>(resolve => { finish = resolve; });
@@ -276,7 +307,7 @@ async function main(args: string[]): Promise<void> {
   const runtime = createSystemRuntime({ dbPath: values.db, mode: mode ?? 'hitl', useMock: values.mock });
   const autopilot = new AutopilotEngine(runtime);
   const mcpServer = new ArbitrageMcpServer({ runtime, autopilot });
-  const server = createArbitrageServer({ ...runtime, autopilot, mcpHandler: mcpServer.createHttpHandler() });
+  const server = createArbitrageServer({ ...runtime, autopilot, marketSync: runtime.marketSync, mcpHandler: mcpServer.createHttpHandler() });
 
   try {
     await new Promise<void>((resolve, reject) => {

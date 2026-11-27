@@ -242,7 +242,7 @@ function readComp(row: Row): SoldComp {
   return withoutUndefined({
     id: row.id as string,
     skuId: row.sku_id as string,
-    source: row.source as SourceName,
+    source: row.source as SoldComp['source'],
     soldPriceCents: row.sold_price_cents as number,
     shippingCents: row.shipping_cents as number,
     totalPriceCents: row.total_price_cents as number,

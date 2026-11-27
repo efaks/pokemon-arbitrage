@@ -481,10 +481,11 @@ export class AutopilotEngine {
     return { buyBook, cycle, triage, repricing, telemetry: this.telemetry.snapshot(this.runtime.db) };
   }
 
-  startDaemon({ hotIntervalMs = 5000, standardIntervalMs = 30_000, repriceIntervalMs = 60_000 }: {
-    hotIntervalMs?: number; standardIntervalMs?: number; repriceIntervalMs?: number;
+  startDaemon({ hotIntervalMs = 5000, standardIntervalMs = 30_000, repriceIntervalMs = 60_000, syncIntervalMs }: {
+    hotIntervalMs?: number; standardIntervalMs?: number; repriceIntervalMs?: number; syncIntervalMs?: number;
   } = {}): void {
-    for (const interval of [hotIntervalMs, standardIntervalMs, repriceIntervalMs]) {
+    for (const interval of [hotIntervalMs, standardIntervalMs, repriceIntervalMs, syncIntervalMs]) {
+      if (interval === undefined) continue;
       if (!Number.isSafeInteger(interval) || interval < 1 || interval > 2_147_483_647) {
         throw new RangeError('Autopilot interval must be between 1 and 2147483647 milliseconds');
       }
@@ -516,6 +517,14 @@ export class AutopilotEngine {
     schedule(hotIntervalMs, () => scan('hot'));
     schedule(standardIntervalMs, () => scan('standard'));
     schedule(repriceIntervalMs, () => this.runRepricingCycle());
+    if (syncIntervalMs !== undefined) {
+      const { marketSync, fmvEngine, config } = this.runtime;
+      schedule(syncIntervalMs, async () => {
+        const nowIso = this.now().toISOString();
+        await marketSync.syncAll({ nowIso, buyBook: this.buyBook, fmvEngine, config });
+        this.refreshedAt = nowIso;
+      });
+    }
   }
 
   stopDaemon(): void {

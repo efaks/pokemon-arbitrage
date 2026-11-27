@@ -27,6 +27,7 @@ const toolNames = [
   'upsert_catalog_sku', 'evaluate_listing', 'list_decisions', 'list_orders', 'approve_hitl_order', 'reject_hitl_order',
   'list_inventory', 'record_intake_qc', 'recommend_exit_channel', 'record_inventory_sale', 'list_audit_events',
   'get_buy_book', 'get_alpha_telemetry', 'ingest_webhook_listing', 'run_autonomous_triage', 'run_repricing_cycle',
+  'sync_market_data',
 ];
 const resourceUris = ['state', 'hitl-queue', 'catalog', 'inventory', 'decisions/recent', 'audit/recent', 'buy-book', 'telemetry']
   .map(path => 'pokemon-arbitrage://' + path);
@@ -101,7 +102,7 @@ test('MCP negotiates protocol versions and handles lifecycle messages and JSON-R
   assertRpcError(batch[2], codes.METHOD_NOT_FOUND);
 });
 
-test('MCP exposes exactly 21 validated tools, 8 resources, and 4 prompts', async t => {
+test('MCP exposes exactly 22 validated tools, 8 resources, and 4 prompts', async t => {
   const { send, server } = setup(t);
   const { tools } = result<{ tools: McpToolDefinition[] }>(await send('tools/list'));
   assert.deepEqual(tools.map(tool => tool.name), toolNames);
@@ -129,10 +130,22 @@ test('MCP exposes exactly 21 validated tools, 8 resources, and 4 prompts', async
     toolCall(2, 'ingest_webhook_listing', { ...cleanListing, currency: 'EUR' }),
     toolCall(2, 'get_alpha_telemetry', { refresh: true }),
     toolCall(2, 'run_repricing_cycle', { inventoryId: 'existing' }),
+    toolCall(2, 'sync_market_data', { limit: 1.5 }),
     toolCall(2, 'unknown'), request(2, 'tools/call', []), request(2, 'resources/read', { uri: 'invalid' }),
     request(2, 'prompts/get', { name: 'review_hitl_queue', arguments: { focusOrderId: false } }),
   ];
   for (const call of invalidCalls) assertRpcError(await server.handleMessage(call), codes.INVALID_PARAMS);
+});
+
+test('MCP sync_market_data returns provider totals and audits the run', async t => {
+  const { runtime, data } = setup(t);
+  const result = await data<{ errorCount: number; totalCompsInserted: number; providers: { enabled: boolean }[] }>(
+    'sync_market_data', { limit: 1 },
+  );
+  assert.equal(result.errorCount, 0);
+  assert.equal(result.totalCompsInserted, 0);
+  assert.deepEqual(result.providers.map(provider => provider.enabled), [false, false, false]);
+  assert.equal(runtime.db.listAuditEvents(1)[0].eventType, 'market.sync_completed');
 });
 
 test('MCP workflow completes scans, human approvals, QC, exit planning, and a sale', async t => {
@@ -382,7 +395,7 @@ test('spawned MCP stdio CLI flushes every JSON-RPC response at EOF with clean st
   assert.deepEqual(responses.map(response => response.id), [null, 1, 2, 3, 4, 5, 6]);
   assertRpcError(responses[0], codes.PARSE_ERROR);
   assert.equal(result<McpInitializeResult>(responses[1]).protocolVersion, '2025-03-26');
-  assert.equal(result<{ tools: McpToolDefinition[] }>(responses[2]).tools.length, 21);
+  assert.equal(result<{ tools: McpToolDefinition[] }>(responses[2]).tools.length, 22);
   const scan = result<McpToolCallResult>(responses[3]);
   assert.equal(scan.isError, undefined);
   assert.equal((scan.structuredContent?.summary as { fetchedCount: number }).fetchedCount, 17);

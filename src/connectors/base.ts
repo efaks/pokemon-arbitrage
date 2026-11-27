@@ -70,6 +70,15 @@ function retryAfterMs(value: string | null): number | undefined {
   return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
 }
 
+export class HttpResponseError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 export async function fetchWithBackoff(
   url: string,
   init: RequestInit,
@@ -97,7 +106,8 @@ export async function fetchWithBackoff(
     await response.body?.cancel().catch(() => undefined);
     if (!retryable || attempt >= maxRetries) {
       const origin = new URL(url).origin;
-      throw new Error(`${init.method ?? 'GET'} ${origin} returned HTTP ${response.status} after ${attempt + 1} attempt(s)`);
+      throw new HttpResponseError(response.status,
+        `${init.method ?? 'GET'} ${origin} returned HTTP ${response.status} after ${attempt + 1} attempt(s)`);
     }
 
     const backoff = Math.min(MAX_BACKOFF_MS, baseDelayMs * 2 ** Math.min(attempt, 52));

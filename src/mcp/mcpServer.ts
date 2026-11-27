@@ -160,7 +160,7 @@ const checkout = { ...localWrite, openWorldHint: true };
 const assessListing = { ...readOnly, openWorldHint: true };
 
 const soldCompSchema = object({
-  id: nonBlank, skuId: nonBlank, source: choice(SourceName), soldPriceCents: positiveMoney,
+  id: nonBlank, skuId: nonBlank, source: choice({ ...SourceName, PRICECHARTING: 'pricecharting' } as const), soldPriceCents: positiveMoney,
   shippingCents: money, totalPriceCents: positiveMoney, condition: choice(CardCondition), grader: choice(Grader),
   grade: nonBlank, soldAt: dateTime, isOutlier: boolean,
 }, 'id', 'source', 'soldPriceCents', 'condition', 'soldAt');
@@ -407,6 +407,11 @@ function makeTools(runtime: SystemRuntime, autopilot: AutopilotEngine): Tool[] {
     }), checkout, async args => ({ ...await autopilot.runAutonomousTriage(args) })),
     tool('run_repricing_cycle', 'Update local listing prices for QC-passed and listed inventory.', noArgs, localWrite,
       () => ({ ...autopilot.runRepricingCycle() })),
+    tool('sync_market_data', 'Import catalog and price data from enabled providers and refresh the Buy Book.',
+      object({ limit }), { ...localWrite, openWorldHint: true, destructiveHint: false },
+      async ({ limit }) => ({
+        ...await runtime.marketSync.syncAll({ limit, buyBook: autopilot.getBuyBook(), fmvEngine, config }),
+      })),
   ];
 }
 

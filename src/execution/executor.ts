@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { HttpResponseError } from '../connectors/base.ts';
 import type { FetchLike } from '../connectors/base.ts';
+import { EbayOAuthTokenManager, withEbayToken } from '../connectors/ebayAuth.ts';
+import type { EbayTokenProvider } from '../connectors/ebayAuth.ts';
 import type { ArbitrageConfig } from '../config.ts';
 import type { ArbitrageDatabase } from '../db/database.ts';
 import { percentOfCents, toCents } from '../domain/money.ts';
@@ -61,6 +64,8 @@ export class SimulatedApiExecutor implements ExecutionAdapter {
 interface EbayOrderOptions {
   accessToken?: string;
   browseAccessToken?: string;
+  tokenProvider?: EbayTokenProvider;
+  browseTokenProvider?: EbayTokenProvider;
   baseUrl?: string;
   browseBaseUrl?: string;
   marketplaceId?: string;
@@ -115,8 +120,8 @@ function usdCents(amount?: EbayAmount): number | undefined {
 }
 
 export class EbayOrderApiExecutor implements ExecutionAdapter {
-  private readonly accessToken?: string;
-  private readonly browseAccessToken?: string;
+  private readonly orderTokenProvider: EbayTokenProvider;
+  private readonly browseTokenProvider: EbayTokenProvider;
   private readonly orderBase: string;
   private readonly purchaseOrderBase: string;
   private readonly browseBase: string;
@@ -126,43 +131,63 @@ export class EbayOrderApiExecutor implements ExecutionAdapter {
 
   constructor(options: EbayOrderOptions = {}) {
     const hostSuffix = options.sandbox ? 'sandbox.ebay.com' : 'ebay.com';
-    this.accessToken = (options.accessToken ?? process.env.EBAY_ORDER_API_TOKEN)?.trim();
-    this.browseAccessToken = (options.browseAccessToken ?? process.env.EBAY_ACCESS_TOKEN ?? this.accessToken)?.trim();
     this.orderBase = (options.baseUrl ?? `https://apix.${hostSuffix}`).replace(/\/+$/, '');
     this.purchaseOrderBase = (options.baseUrl ?? `https://api.${hostSuffix}`).replace(/\/+$/, '');
     this.browseBase = (options.browseBaseUrl ?? options.baseUrl ?? `https://api.${hostSuffix}`).replace(/\/+$/, '');
     this.marketplaceId = options.marketplaceId ?? 'EBAY_US';
     this.fetchFn = options.fetchFn ?? fetch;
     this.guestCheckout = options.guestCheckout;
+    const oauthOptions = {
+      clientId: process.env.EBAY_CLIENT_ID, clientSecret: process.env.EBAY_CLIENT_SECRET,
+      sandbox: options.sandbox, fetchFn: this.fetchFn,
+    };
+    this.orderTokenProvider = options.tokenProvider ?? (options.accessToken === ''
+      ? new EbayOAuthTokenManager({ staticToken: '' })
+      : new EbayOAuthTokenManager({
+        ...oauthOptions, staticToken: options.accessToken ?? process.env.EBAY_ORDER_API_TOKEN ?? '',
+        refreshToken: options.guestCheckout ? '' : process.env.EBAY_REFRESH_TOKEN,
+        scopes: options.guestCheckout ? ['https://api.ebay.com/oauth/api_scope/buy.guest.order'] : undefined,
+      }));
+    const browseToken = (options.browseAccessToken ?? process.env.EBAY_ACCESS_TOKEN)?.trim();
+    const browseProvider = new EbayOAuthTokenManager({
+      ...oauthOptions, staticToken: browseToken ?? '', refreshToken: '',
+      ...(options.browseAccessToken === '' ? { clientId: '', clientSecret: '' } : {}),
+    });
+    this.browseTokenProvider = options.browseTokenProvider ??
+      (options.browseAccessToken !== undefined || browseProvider.isConfigured() ? browseProvider : this.orderTokenProvider);
   }
 
-  private async request(url: string, token: string, step: string, method = 'GET', body?: object): Promise<Response> {
-    const response = await this.fetchFn(url, {
-      method,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        'X-EBAY-C-MARKETPLACE-ID': this.marketplaceId,
-      },
-      body: body && JSON.stringify(body),
-      redirect: 'error',
-      signal: AbortSignal.timeout(15_000),
+  private request(url: string, provider: EbayTokenProvider, step: string, method = 'GET', body?: object): Promise<Response> {
+    return withEbayToken(provider, async token => {
+      const response = await this.fetchFn(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': this.marketplaceId,
+        },
+        body: body && JSON.stringify(body),
+        redirect: 'error',
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new HttpResponseError(response.status, `eBay ${step} returned HTTP ${response.status}`);
+      }
+      return response;
     });
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => undefined);
-      throw new Error(`eBay ${step} returned HTTP ${response.status}`);
-    }
-    return response;
   }
 
   async verifyLiveListing(listing: RawListing): Promise<LiveListingCheck> {
     const unavailable = (reason: string) => ({ ...listedQuote(listing), available: false, reason });
-    if (!this.accessToken || !this.browseAccessToken) return unavailable('eBay Order API token is missing');
+    if (!this.orderTokenProvider.isConfigured() || !this.browseTokenProvider.isConfigured()) {
+      return unavailable('eBay Order API token is missing');
+    }
     if (listing.source !== 'ebay') return unavailable('eBay Order API requires an eBay listing');
     try {
       const response = await this.request(
         `${this.browseBase}/buy/browse/v1/item/${encodeURIComponent(listing.listingId)}`,
-        this.browseAccessToken, 'Browse verification',
+        this.browseTokenProvider, 'Browse verification',
       );
       const item = await response.json() as EbayBrowseItem;
       const price = usdCents(item.price);
@@ -187,7 +212,7 @@ export class EbayOrderApiExecutor implements ExecutionAdapter {
   }
 
   async executePurchase(order: PurchaseOrder, listing: RawListing): Promise<ExecutePurchaseResult> {
-    if (!this.accessToken) return { success: false, failureReason: 'eBay Order API token is missing' };
+    if (!this.orderTokenProvider.isConfigured()) return { success: false, failureReason: 'eBay Order API token is missing' };
     if (listing.source !== 'ebay') return { success: false, failureReason: 'Complete checkout through the listing link' };
 
     const guest = this.guestCheckout;
@@ -199,7 +224,7 @@ export class EbayOrderApiExecutor implements ExecutionAdapter {
     let externalOrderId: string | undefined;
     try {
       const sessionResponse = await this.request(
-        `${base}/${checkoutPath}/initiate`, this.accessToken, 'checkout initiation', 'POST',
+        `${base}/${checkoutPath}/initiate`, this.orderTokenProvider, 'checkout initiation', 'POST',
         guest ? { lineItemInputs, contactEmail: guest.contactEmail, shippingAddress: guest.shippingAddress }
           : { lineItemInputs },
       );
@@ -218,7 +243,7 @@ export class EbayOrderApiExecutor implements ExecutionAdapter {
         });
         if (!externalOrderId) return { success: false, failureReason: 'eBay guest checkout was not completed' };
         const response = await this.request(
-          `${lookupBase}/guest_purchase_order/${encodeURIComponent(externalOrderId)}`, this.accessToken, 'guest order lookup',
+          `${lookupBase}/guest_purchase_order/${encodeURIComponent(externalOrderId)}`, this.orderTokenProvider, 'guest order lookup',
         );
         purchase = await response.json() as EbayPurchase;
         const purchasedTotal = usdCents(purchase.pricingSummary?.total);
@@ -228,16 +253,16 @@ export class EbayOrderApiExecutor implements ExecutionAdapter {
           return { success: false, externalOrderId, failureReason: 'eBay guest order details did not match the approved order' };
         }
       } else {
-        // A placement request can succeed even if the response is lost. Never retry it automatically.
+        // Retry only a definitive 401. A lost response may still mean the order was placed.
         const response = await this.request(
           `${base}/${checkoutPath}/${encodeURIComponent(session.checkoutSessionId)}/place_order`,
-          this.accessToken, 'order placement', 'POST', {},
+          this.orderTokenProvider, 'order placement', 'POST', {},
         );
         purchase = await response.json() as EbayPurchase;
         externalOrderId = purchase.purchaseOrderId;
         if (externalOrderId && purchase.purchaseOrderPaymentStatus === 'PENDING') {
           const lookup = await this.request(
-            `${lookupBase}/purchase_order/${encodeURIComponent(externalOrderId)}`, this.accessToken, 'purchase order lookup',
+            `${lookupBase}/purchase_order/${encodeURIComponent(externalOrderId)}`, this.orderTokenProvider, 'purchase order lookup',
           );
           purchase = await lookup.json() as EbayPurchase;
         }

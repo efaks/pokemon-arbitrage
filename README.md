@@ -36,6 +36,7 @@ Run commands from the repository root with Node.js 26. Install the development d
 | --- | --- |
 | `npm run demo` | Run a simulated live scan in memory and print purchases, review items, and skipped listings. |
 | `npm run scan -- --mock --db :memory: --mode shadow` | Run one scan and print the results. |
+| `npm run sync -- --db data/arbitrage.sqlite --limit 50` | Import market data from configured providers and print a JSON summary. |
 | `npm run serve -- --mock --db :memory: --mode hitl --port 3000` | Serve the loopback dashboard and MCP HTTP endpoint. Add `--poll-ms 60000` for recurring scans. |
 | `npm run autopilot -- --mock --db :memory: --once` | Run the Buy Book, concurrent scan, triage, and repricing in one pass. |
 | `node src/cli.ts mcp --mock --db :memory: --mode hitl` | Start a simulated MCP server over stdio. |
@@ -49,7 +50,7 @@ The Buy Book precomputes fair market value, liquidity, momentum, and exact zero-
 
 Push intake and priority scans recover curated typos and known missing card-number slashes before matching. The engine reports buylist margin and raw-to-graded expected value without changing the existing risk decision thresholds. The grading model defaults to a $25 fee, a 60% top-grade probability, a 30% runner-up probability at 55% of top-grade FMV, and raw resale for the remaining outcomes. It applies selling fees, shipping, and packaging to each outcome. Treat those assumptions as estimates.
 
-Run `node src/cli.ts autopilot --mode shadow --db :memory: --mock --once` for a summary of polling tiers, triage, repricing, and latency. Omit `--once` for recurring hot and standard polling at 5 and 30 seconds, with repricing every 60 seconds. Set `--hot-ms`, `--standard-ms`, and `--reprice-ms` to change those intervals. A full pass includes the cold tier. The engine polls enabled connectors concurrently through their existing API rate limiters and backoff.
+Run `node src/cli.ts autopilot --mode shadow --db :memory: --mock --once` for a summary of polling tiers, triage, repricing, and latency. Omit `--once` for recurring hot and standard polling at 5 and 30 seconds, with repricing every 60 seconds. Set `--hot-ms`, `--standard-ms`, and `--reprice-ms` to change those intervals. Add `--sync-ms 3600000` to sync market data and refresh the Buy Book hourly in daemon mode. A full pass includes the cold tier. The engine polls enabled connectors concurrently through their existing API rate limiters and backoff.
 
 Triage can approve eligible queued orders with a landed cost up to $500 by default. It checks the kill switch, momentum, authorized checkout and cached listing details. Raw approvals also require a trusted seller and at least two photos. Anomalies remain available for operator review unless an explicit triage call opts into rejection. A source is throttled after at least three sales with negative aggregate realized P&L, or after at least three completed checkout attempts if more than half failed. Telemetry reports p50, p95, p99, and max processing and checkout latency plus signal counts, execution rates, and source P&L. Latency samples and intake counters are process-local. Completed orders and sales are read from SQLite.
 
@@ -65,6 +66,7 @@ Fulfillment recommends immediate buylist when its net profit clears the configur
 | `GET /api/telemetry` | Read alpha, latency, and source performance metrics. |
 | `POST /api/webhooks/listing` | Push a listing through the fast path under the persisted operating mode. |
 | `POST /api/autopilot/pass` | Run a pass using optional JSON field `tier` with `all`, `hot`, `standard`, or `cold`. |
+| `POST /api/sync` | Run market sync using an optional positive integer `limit`, then refresh the Buy Book. |
 
 For example, push a fixture from the same host while running `serve --mock --mode shadow`.
 
@@ -78,7 +80,7 @@ Supply the source's stable `listingId`, actual seller profile, and checkout capa
 
 ## MCP integration
 
-The server negotiates `2025-03-26` and `2024-11-05`. It exposes 21 tools, 8 resources, and 4 prompts over both transports.
+The server negotiates `2025-03-26` and `2024-11-05`. It exposes 22 tools, 8 resources, and 4 prompts over both transports.
 
 **Stdio.** Launch `node src/cli.ts mcp` directly from a client. The process reads one JSON-RPC frame per line from stdin and writes only JSON-RPC frames to stdout. Use the Node command in client configuration to keep npm's script banner out of the stream.
 
@@ -124,6 +126,7 @@ Use `tools/list` for input schemas and `tools/call` with `params.name` and `para
 | `ingest_webhook_listing` | Push a listing through the current operating mode, with optional `skipDeduplication`. |
 | `run_autonomous_triage` | Process the review queue with optional `maxApproveCents` and `autoRejectAnomalies`. |
 | `run_repricing_cycle` | Update local listing records based on item age, exit channel, and profit floor. |
+| `sync_market_data` | Import market data and refresh the Buy Book. Accepts an optional positive integer `limit`. |
 
 `run_scan_cycle` with `useMock: true` selects the fixture feed and seeds an empty catalog. The runtime's verifier and checkout adapter are selected at startup. Launch with `--mock` to simulate the whole workflow. `evaluate_listing` supplies a hypothetical trusted seller when seller data is omitted. Supply the actual seller profile when assessing seller trust.
 
@@ -170,8 +173,19 @@ Export connector credentials for the process that launches the CLI or MCP server
 
 | Variable | Use |
 | --- | --- |
-| `EBAY_ACCESS_TOKEN` | eBay Browse API access. |
-| `EBAY_ORDER_API_TOKEN` | eBay Order API checkout access. |
+| `EBAY_CLIENT_ID` | eBay OAuth client ID. Browse mints an application access token when both client credentials are set. |
+| `EBAY_CLIENT_SECRET` | eBay OAuth client secret. OAuth tokens are cached in memory and refreshed near expiry. |
+| `EBAY_REFRESH_TOKEN` | Consented user refresh token for eBay member checkout. Requires both client credentials and approved Order API access. |
+| `EBAY_ACCESS_TOKEN` | Static Browse access token for use without OAuth client credentials. |
+| `EBAY_ORDER_API_TOKEN` | Static Order API user access token for use without OAuth client credentials. |
+| `POKEMON_TCG_API_KEY` | Enables the Pokémon TCG API catalog and TCGplayer market price sync. |
+| `PRICECHARTING_API_TOKEN` | Enables PriceCharting price snapshots. |
+| `EBAY_INSIGHTS_ENABLED` | Set to `true` to enable sold comps with an approved Marketplace Insights token or OAuth credentials. |
+| `EBAY_INSIGHTS_CATEGORY_IDS` | Optional comma-separated category IDs approved for the Marketplace Insights application. |
+| `VISION_API_KEY` | API key for live listing photo assessment. |
+| `VISION_API_URL` | OpenAI-compatible API base or chat completions endpoint. The runtime selects live vision when both URL and key are set. |
+| `VISION_MODEL` | Vision model name. Defaults to `gpt-4o-mini`. |
+| `ARBITRAGE_WEBHOOK_URL` | Sends live decision, order, and circuit breaker alerts to the configured webhook. MCP stdio reserves stdout for JSON-RPC. |
 | `BESTBUY_API_KEY` | Best Buy catalog API access. |
 | `COSTCO_FEED_URL` | Authorized Costco HTTPS JSON feed. Set this to enable the connector. |
 | `COSTCO_API_KEY` | Optional bearer token for the Costco feed. |
@@ -206,4 +220,21 @@ Export connector credentials for the process that launches the CLI or MCP server
 | `ARBITRAGE_SELLER_MIN_ACCOUNT_AGE_DAYS` | `90` |
 | `ARBITRAGE_CIRCUIT_BREAKER_MAX_ERRORS_PER_WINDOW` | `5` |
 
-The optional vision verifier supports `VISION_API_URL`, `VISION_API_KEY`, and `VISION_MODEL` when explicitly injected. The CLI runtime uses the heuristic verifier.
+## Market data sync
+
+Sync runs configured providers in order and returns per-provider import counts and errors. The default limit is 50 catalog results for Pokémon TCG API and 50 catalog SKUs each for PriceCharting and eBay. A repeated sync on the same UTC day skips existing pricing snapshots, and eBay sales deduplicate by item ID. The HTTP and MCP entry points also refresh the in-process Buy Book.
+
+```sh
+npm run sync -- --db data/arbitrage.sqlite --limit 10
+curl http://127.0.0.1:3000/api/sync -H 'Content-Type: application/json' -d '{"limit":10}'
+```
+
+TCGplayer and PriceCharting imports are market price snapshots that feed valuation. PriceCharting's `graded-price` is an aggregate grade-9 figure for cards. Check that imported prices and grade assumptions fit the SKUs you plan to trade. Marketplace Insights provides eBay sales and requires limited-release access and approved search categories. [Pokémon TCG card data](https://docs.pokemontcg.io/api-reference/cards/card-object/) · [PriceCharting price fields](https://www.pricecharting.com/api-documentation) · [eBay Buy API requirements](https://developer.ebay.com/api-docs/buy/buy-requirements.html)
+
+## Going Live Checklist
+
+1. Run `npm test` and `npm run demo`, then create a separate database for real data. Keep it in shadow mode while validating feeds.
+2. Configure eBay application credentials. For member checkout, confirm production Order API approval and obtain a refresh token with the appropriate member permissions. Enable Marketplace Insights only after confirming entitlement and category access. [eBay Order API](https://developer.ebay.com/api-docs/buy/api-order.html)
+3. Configure the market data providers you use, run a small sync, and review its errors, catalog matches, prices, and Buy Book entries.
+4. Set the vision URL and key if you use live photo assessment. Configure your webhook and confirm it receives alerts during a pilot scan.
+5. Review spend caps, cash reserve, per-SKU limits, and the kill switch. Review real decisions in shadow and then in HITL before enabling live checkout. In HITL, the autopilot daemon can approve eligible orders under its autonomous policy.

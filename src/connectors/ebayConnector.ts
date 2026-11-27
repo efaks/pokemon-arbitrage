@@ -2,9 +2,12 @@ import { toCents } from '../domain/money.ts';
 import type { CanonicalSku, CardCondition, RawListing } from '../domain/types.ts';
 import { fetchWithBackoff, TokenBucketRateLimiter } from './base.ts';
 import type { FetchLike, SupplyConnector } from './base.ts';
+import { EbayOAuthTokenManager, withEbayToken } from './ebayAuth.ts';
+import type { EbayTokenProvider } from './ebayAuth.ts';
 
 export interface EbayConnectorOptions {
   accessToken?: string;
+  tokenProvider?: EbayTokenProvider;
   baseUrl?: string;
   marketplaceId?: string;
   limitPerQuery?: number;
@@ -88,7 +91,7 @@ export class EbayBrowseConnector implements SupplyConnector {
   readonly source = 'ebay';
   readonly supportsAutoCheckout = true;
   readonly pollIntervalMs = 60_000;
-  private readonly accessToken?: string;
+  private readonly tokenProvider: EbayTokenProvider;
   private readonly baseUrl: string;
   private readonly marketplaceId: string;
   private readonly limitPerQuery: number;
@@ -96,21 +99,30 @@ export class EbayBrowseConnector implements SupplyConnector {
   private readonly rateLimiter: TokenBucketRateLimiter;
 
   constructor(options: EbayConnectorOptions = {}) {
-    this.accessToken = (options.accessToken ?? process.env.EBAY_ACCESS_TOKEN)?.trim();
     this.baseUrl = (options.baseUrl ?? 'https://api.ebay.com').replace(/\/+$/, '');
     this.marketplaceId = options.marketplaceId ?? 'EBAY_US';
     this.limitPerQuery = options.limitPerQuery ?? 25;
     this.fetchFn = options.fetchFn;
     this.rateLimiter = options.rateLimiter ?? new TokenBucketRateLimiter({ capacity: 2, refillPerSecond: 2 });
+    this.tokenProvider = options.tokenProvider ?? new EbayOAuthTokenManager({
+      staticToken: options.accessToken ?? process.env.EBAY_ACCESS_TOKEN,
+      clientId: options.accessToken === '' ? '' : process.env.EBAY_CLIENT_ID,
+      clientSecret: options.accessToken === '' ? '' : process.env.EBAY_CLIENT_SECRET,
+      refreshToken: '',
+      sandbox: new URL(this.baseUrl).hostname.endsWith('.sandbox.ebay.com'),
+      fetchFn: this.fetchFn,
+    });
   }
 
   isEnabled(): boolean {
-    return Boolean(this.accessToken);
+    return this.tokenProvider.isConfigured();
   }
 
   async fetchListings(skus: CanonicalSku[]): Promise<RawListing[]> {
-    if (!this.accessToken) return [];
-    const queries = new Set(skus.map(sku => sku.name));
+    if (!this.isEnabled()) return [];
+    const queries = new Set(skus.map(sku =>
+      sku.cardNumber && !sku.name.includes(sku.cardNumber) ? `${sku.name} ${sku.cardNumber}` : sku.name,
+    ));
     const listings = new Map<string, RawListing>();
     const fetchedAt = new Date().toISOString();
     for (const query of queries) {
@@ -118,14 +130,15 @@ export class EbayBrowseConnector implements SupplyConnector {
       url.search = new URLSearchParams({
         q: query, filter: 'buyingOptions:{FIXED_PRICE}', sort: 'newlyListed', limit: String(this.limitPerQuery),
       }).toString();
-      const response = await fetchWithBackoff(url.href, {
+      const response = await withEbayToken(this.tokenProvider, token => fetchWithBackoff(url.href, {
         method: 'GET',
         headers: {
-          Authorization: `Bearer ${this.accessToken}`,
+          Authorization: `Bearer ${token}`,
           'X-EBAY-C-MARKETPLACE-ID': this.marketplaceId,
         },
         redirect: 'error',
-      }, { fetchFn: this.fetchFn, rateLimiter: this.rateLimiter });
+        signal: AbortSignal.timeout(15_000),
+      }, { fetchFn: this.fetchFn, rateLimiter: this.rateLimiter }));
 
       const { itemSummaries } = await response.json() as { itemSummaries?: EbayItemSummary[] };
       for (const item of itemSummaries ?? []) {
