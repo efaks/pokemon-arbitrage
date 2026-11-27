@@ -242,12 +242,16 @@ test('triage approves eligible raw and sealed orders and holds anomalies, retail
   const order = (listingId: string) => db.listOrders(undefined, -1).find(item => item.listingId === listingId);
   assert.equal(triage.approvedCount, 2);
   for (const id of ['mock-zard-raw-nm', 'mock-ssp-bb-clean']) assert.equal(order(id)?.status, 'filled');
-  for (const id of ['mock-pre-etb-retailer', 'mock-evs-bb-anomaly', 'mock-lugia-cgc10-clean']) {
+  for (const id of [
+    'mock-pre-etb-retailer', 'mock-evs-bb-anomaly', 'mock-lugia-cgc10-clean', 'mock-costco-151-tins', 'mock-pc-pre-etb',
+  ]) {
     assert.equal(order(id)?.status, 'pending_hitl');
   }
   const second = await autopilot.runAutonomousTriage({ maxApproveCents: 20_000, autoRejectAnomalies: true });
-  assert.equal(second.rejectedCount, 1);
+  assert.equal(second.rejectedCount, 2);
   assert.equal(order('mock-evs-bb-anomaly')?.status, 'rejected');
+  assert.equal(order('mock-pc-pre-etb')?.status, 'rejected');
+  assert.equal(order('mock-costco-151-tins')?.status, 'pending_hitl');
 });
 
 test('triage rechecks momentum after a queued order and requires raw photo evidence', async t => {
@@ -339,7 +343,7 @@ test('loopback HTTP accepts validated push listings and exposes Buy Book, teleme
   assert.equal((await post('/api/autopilot/pass', { tier: 'unknown' })).status, 400);
   const pass = await post('/api/autopilot/pass', { tier: 'all' });
   assert.equal(pass.status, 200);
-  assert.equal((await pass.json()).cycle.fetchedCount, 15);
+  assert.equal((await pass.json()).cycle.fetchedCount, 17);
   const legacy = await listen(t, createArbitrageServer({ ...runtime, autopilot: undefined }));
   assert.equal((await fetch(legacy + '/api/buy-book')).status, 501);
   assert.equal((await fetch(legacy + '/api/telemetry')).status, 501);

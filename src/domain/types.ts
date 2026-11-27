@@ -29,6 +29,8 @@ export const SourceName = {
   TCGPLAYER: 'tcgplayer',
   CARDMARKET: 'cardmarket',
   BESTBUY: 'bestbuy',
+  COSTCO: 'costco',
+  POKEMON_CENTER: 'pokemon_center',
   WALMART: 'walmart',
   LGS_SHOPIFY: 'lgs_shopify',
   DISTRIBUTOR: 'distributor',

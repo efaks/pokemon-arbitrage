@@ -58,14 +58,14 @@ test('dry-run evaluation returns a decision without persisting or marking the li
   assert.equal(db.listDecisions()[0].id, persisted.decision.id);
 });
 
-test('live mock scan fills two orders, queues four reviews, and deduplicates all 15 unchanged listings', async t => {
+test('live mock scan fills two orders, queues six reviews, and deduplicates all 17 unchanged listings', async t => {
   const system = runtime(t);
   const { db, pipeline } = system;
   const first = await pipeline.runCycle();
   assert.deepEqual({
     fetched: first.fetchedCount, matched: first.matchedCount, rejected: first.rejectedCount,
     filled: first.autoBoughtCount, queued: first.hitlQueuedCount, skipped: first.skippedCount, errors: first.errors,
-  }, { fetched: 15, matched: 11, rejected: 4, filled: 2, queued: 4, skipped: 9, errors: [] });
+  }, { fetched: 17, matched: 13, rejected: 4, filled: 2, queued: 6, skipped: 9, errors: [] });
 
   const filled = db.listOrders('filled');
   assert.deepEqual(filled.map(order => order.skuId).sort(), ['graded-cgc10-swsh12-186', 'sealed-ssp-bb']);
@@ -77,9 +77,12 @@ test('live mock scan fills two orders, queues four reviews, and deduplicates all
     ['mock-moonbreon-psa10-highcap', /single-order limit/],
     ['mock-zard-raw-nm', /photo\/condition/],
     ['mock-evs-bb-anomaly', /anomaly/i],
+    ['mock-costco-151-tins', /sanctioned automated checkout/],
+    ['mock-pc-pre-etb', /anomaly/i],
   ] as const) {
     assert.ok(pending(system, id).decisionWarnings.some(text => warning.test(text)));
   }
+  assert.ok(pending(system, 'mock-costco-151-tins').decisionWarnings.every(warning => !/anomaly/i.test(warning)));
   const skipped = new Map(db.listDecisions(-1, 'skip').map(decision => [decision.listingId, decision]));
   assert.deepEqual([...skipped.keys()].sort(), [
     'mock-151-thin-margin', 'mock-crz-sketchy-seller', 'mock-digital-code-trap', 'mock-evs-empty-box',
@@ -89,11 +92,11 @@ test('live mock scan fills two orders, queues four reviews, and deduplicates all
   assert.equal(skipped.get('mock-zard-006-holo')?.skuId, 'raw-en-sv3pt5-006-holo');
 
   const second = await pipeline.runCycle();
-  assert.equal(second.fetchedCount, 15);
-  assert.equal(second.deduplicatedCount, 15);
+  assert.equal(second.fetchedCount, 17);
+  assert.equal(second.deduplicatedCount, 17);
   assert.equal(second.autoBoughtCount, 0);
-  assert.equal(db.listOrders().length, 6);
-  assert.equal(db.listDecisions().length, 15);
+  assert.equal(db.listOrders().length, 8);
+  assert.equal(db.listDecisions().length, 17);
   assert.equal(db.getSystemState().lastScanAt, second.finishedAt);
   assert.equal(db.listAuditEvents().filter(event => event.eventType === 'cycle.completed').length, 2);
 });
@@ -102,7 +105,7 @@ test('the $1,000 daily cap blocks Moonbreon after both clean orders fill', async
   const { db, pipeline } = runtime(t, { configOverrides: { dailySpendCapCents: 100_000 } });
   const summary = await pipeline.runCycle();
   assert.equal(summary.autoBoughtCount, 2);
-  assert.equal(summary.hitlQueuedCount, 3);
+  assert.equal(summary.hitlQueuedCount, 5);
   const decision = db.listDecisions(-1, 'skip').find(candidate => candidate.listingId === 'mock-moonbreon-psa10-highcap');
   assert.equal(decision?.reasons[0], 'Daily spend cap exceeded');
 });
@@ -113,7 +116,7 @@ test('the kill switch blocks all purchases and pending reviews on a fresh scan',
   const summary = await pipeline.runCycle();
   assert.equal(summary.autoBoughtCount, 0);
   assert.equal(summary.hitlQueuedCount, 0);
-  assert.equal(summary.skippedCount, 15);
+  assert.equal(summary.skippedCount, 17);
   assert.deepEqual(db.listOrders(), []);
   assert.ok(db.listDecisions().every(decision => /Kill switch engaged/.test(decision.reasons[0])));
 });
@@ -139,7 +142,7 @@ test('the circuit breaker counts consecutive failures, resets on success, and bl
   const summary = await pipeline.runCycle({ connectors: [failing, ...connectors] });
   assert.equal(summary.killSwitchTriggered, true);
   assert.equal(summary.autoBoughtCount, 0);
-  assert.equal(summary.skippedCount, 15);
+  assert.equal(summary.skippedCount, 17);
   assert.equal(db.getSystemState().consecutiveErrors, 3);
   assert.match(db.getSystemState().killSwitchReason ?? '', /Circuit breaker/);
 });
@@ -271,8 +274,8 @@ test('HTTP dashboard supports scan, HITL, controls, and inventory workflows with
   assert.deepEqual(await (await get('/api/health')).json(), { status: 'ok' });
   assert.equal((await (await get('/api/state')).json()).systemState.operatingMode, 'live');
   assert.equal((await post('/api/scan', {})).status, 200);
-  assert.equal((await (await get('/api/state')).json()).pendingHitlCount, 4);
-  assert.equal((await (await get('/api/orders')).json()).length, 6);
+  assert.equal((await (await get('/api/state')).json()).pendingHitlCount, 6);
+  assert.equal((await (await get('/api/orders')).json()).length, 8);
   assert.equal((await (await get('/api/decisions?action=skip')).json()).length, 9);
   assert.ok((await (await get('/api/audit')).json()).some((event: { eventType: string }) => event.eventType === 'cycle.completed'));
 

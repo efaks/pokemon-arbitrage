@@ -59,6 +59,38 @@ test('matches an ETB or booster display alias while enforcing product type', asy
   assert.equal(wrongProduct.status, 'unmatched');
 });
 
+test('separates Pokémon Center and regular Prismatic Evolutions ETBs with and without UPCs', async () => {
+  const regular = sku('sealed-pre-etb');
+  const exclusive = sku('sealed-pre-pc-etb');
+  for (const [title, expected, other] of [
+    ['Prismatic Evolutions Pokémon Center Elite Trainer Box', exclusive, regular],
+    ['Prismatic Evolutions PC ETB', exclusive, regular],
+    ['Prismatic Evolutions Elite Trainer Box', regular, exclusive],
+  ] as const) {
+    const byTitle = await resolver.resolve(listing(title), catalog);
+    assert.equal(byTitle.skuId, expected.id);
+    assert.equal(byTitle.confidence, 0.92);
+    const byUpc = await resolver.resolve(listing(title, { upc: expected.upc }), catalog);
+    assert.equal(byUpc.skuId, expected.id);
+    assert.equal(byUpc.confidence, 0.97);
+    assert.equal((await resolver.resolve(listing(title), [other])).status, 'unmatched');
+    assert.equal((await resolver.resolve(listing(title, { upc: other.upc }), catalog)).status, 'unmatched');
+  }
+});
+
+test('matches the Costco 151 five-pack by title without treating it as a single tin or booster bundle', async () => {
+  const bundle = sku('sealed-151-costco-bundle');
+  for (const title of [
+    'Pokemon TCG Scarlet & Violet 151 Mini Tins 5-Pack Costco Bundle',
+    'Costco Pokemon 151 Mini Tins 5 Pack',
+    '151 5-Pack Mini Tin Bundle',
+  ]) {
+    assert.equal((await resolver.resolve(listing(title), catalog)).skuId, bundle.id);
+  }
+  assert.equal((await resolver.resolve(listing('Pokemon Scarlet & Violet 151 Mini Tin'), catalog)).status, 'unmatched');
+  assert.equal((await resolver.resolve(listing('Pokemon 151 Booster Bundle'), catalog)).skuId, 'sealed-151-bundle');
+});
+
 for (const [title, flag, upc] of [
   ['Evolving Skies Booster Box EMPTY Display Box Only', 'empty display', '820650818874'],
   ['Charizard ex 199/165 Gold Metal Custom Proxy', 'gold metal'],

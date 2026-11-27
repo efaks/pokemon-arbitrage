@@ -41,14 +41,18 @@ const CONDITIONS: [CardCondition, RegExp][] = [
   ['NM', /\b(?:nm|near[\s-]+mint)\b/i],
 ];
 
+const POKEMON_CENTER_ETB = 'pokemon center elite trainer box';
+const REGULAR_ETB = 'elite trainer box';
 const SEALED_TYPES = [
-  ['elite trainer box', /\b(?:elite[\s-]+trainer[\s-]+box(?:es)?|etbs?)\b/gi],
+  [POKEMON_CENTER_ETB, /\b(?:pok[eé]mon[\s-]+center|pc)[\s-]+(?:elite[\s-]+trainer[\s-]+box(?:es)?|etbs?)\b/gi],
+  [REGULAR_ETB, /\b(?:elite[\s-]+trainer[\s-]+box(?:es)?|etbs?)\b/gi],
   ['booster bundle', /\bbooster[\s-]+bundles?\b/gi],
   ['booster box', /\bbooster[\s-]+(?:box(?:es)?|displays?)\b/gi],
   ['booster pack', /\bbooster[\s-]+packs?\b/gi],
   ['collection box', /\bcollection[\s-]+box(?:es)?\b/gi],
   ['case', /\b(?:sealed[\s-]+case|case[\s-]+of)\b/gi],
   ['blister', /\bblisters?\b/gi],
+  ['mini tin bundle', /\b(?:mini[\s-]+tins?[\s-]+(?:\d+[\s-]*pack|bundle)|costco[\s-]+bundle)\b/gi],
   ['tin', /\btins?\b/gi],
   ['deck', /\bdecks?\b/gi],
 ] as const;
@@ -70,7 +74,15 @@ function includesPhrase(text: string, phrase: string): boolean {
 }
 
 function productTypes(text: string): string[] {
-  return SEALED_TYPES.filter(([, pattern]) => [...text.matchAll(pattern)].length > 0).map(([kind]) => kind);
+  const kinds = new Set<string>();
+  for (const [kind, pattern] of SEALED_TYPES) {
+    text = text.replace(pattern, () => {
+      kinds.add(kind);
+      // Prevent later patterns from reusing or spanning an already classified phrase.
+      return '\0';
+    });
+  }
+  return [...kinds];
 }
 
 function sealedWords(text: string): string[] {
@@ -79,8 +91,14 @@ function sealedWords(text: string): string[] {
 }
 
 function scoreSealed(title: string, kinds: string[], upc: string | undefined, sku: CanonicalSku): number {
-  if (upc) return sku.upc === upc ? 0.97 : 0;
-  const expectedKinds = productTypes([sku.name, ...sku.aliases].join(' '));
+  if (upc && sku.upc !== upc) return 0;
+  const expectedKinds = [...new Set([sku.name, ...sku.aliases].flatMap(productTypes))];
+  if (upc) {
+    // Generic UPC listings can omit a product form, but an explicit ETB edition must agree.
+    const listedEditions = kinds.filter(kind => kind === POKEMON_CENTER_ETB || kind === REGULAR_ETB);
+    const isEtb = expectedKinds.includes(POKEMON_CENTER_ETB) || expectedKinds.includes(REGULAR_ETB);
+    return isEtb && listedEditions.some(kind => !expectedKinds.includes(kind)) ? 0 : 0.97;
+  }
   if (kinds.length && !kinds.every(kind => expectedKinds.includes(kind))) return 0;
   if (!kinds.length) return 0;
 

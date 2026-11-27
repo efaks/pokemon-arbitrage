@@ -85,6 +85,24 @@ const scenarios: Scenario[] = [
     listingId: 'mock-digital-code-trap',
     title: 'Pokemon 151 Charizard ex 199/165 PTCG Live Digital Code Card', priceCents: 1000,
   },
+  {
+    listingId: 'mock-costco-151-tins', source: 'costco',
+    title: 'Pokemon TCG Scarlet & Violet 151 Mini Tins 5-Pack Costco Bundle',
+    upc: '820650859991', priceCents: 3799, conditionHint: 'SEALED', supportsAutoCheckout: false,
+    seller: {
+      sellerId: 'mock-costco', username: 'Costco Wholesale', feedbackScore: 10_000, positivePercent: 99.9,
+      accountAgeDays: 3650, returnsAccepted: true,
+    },
+  },
+  {
+    listingId: 'mock-pc-pre-etb', source: 'pokemon_center',
+    title: 'Pokemon TCG Prismatic Evolutions Pokemon Center Elite Trainer Box',
+    upc: '820650859434', priceCents: 5999, conditionHint: 'SEALED', supportsAutoCheckout: false,
+    seller: {
+      sellerId: 'mock-pokemon-center', username: 'Pokémon Center', feedbackScore: 10_000, positivePercent: 99.9,
+      accountAgeDays: 3650, returnsAccepted: true,
+    },
+  },
 ];
 
 export class MockScenarioConnector implements SupplyConnector {

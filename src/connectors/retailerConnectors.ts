@@ -15,6 +15,26 @@ function seller(name: string): SellerProfile {
   };
 }
 
+function firstPartyRetailerSeller(sellerId: string, username: string): SellerProfile {
+  return {
+    sellerId, username, feedbackScore: 10_000, positivePercent: 99.9,
+    accountAgeDays: 3650, returnsAccepted: true,
+  };
+}
+
+function httpsUrl(value: unknown): URL | null {
+  if (typeof value !== 'string' || !/^https:\/\//i.test(value.trim())) return null;
+  const url = URL.parse(value.trim());
+  return url?.protocol === 'https:' && !url.username && !url.password ? url : null;
+}
+
+function configuredFeedUrl(value: string | undefined, variable: string): string | undefined {
+  if (!value?.trim()) return undefined;
+  const url = httpsUrl(value);
+  if (!url) throw new Error(`${variable} must be an HTTPS URL without embedded credentials`);
+  return url.href;
+}
+
 function priceCents(value: number | string | null | undefined): number | undefined {
   if (value == null || typeof value === 'string' && !value.trim()) return undefined;
   const cents = toCents(Number(value));
@@ -79,9 +99,160 @@ export class BestBuyApiConnector implements SupplyConnector {
           description: product.shortDescription ?? '', url: product.url, upc: product.upc,
           priceCents: cents, shippingCents: 0, currency: 'USD', quantity: 1,
           conditionHint: 'SEALED', imageUrls: product.image ? [product.image] : [],
-          seller: seller('Best Buy'), supportsAutoCheckout: false, listedAt: now, fetchedAt: now,
+          seller: firstPartyRetailerSeller('Best Buy', 'Best Buy'),
+          supportsAutoCheckout: false, listedAt: now, fetchedAt: now,
         });
       }
+    }
+    return listings;
+  }
+}
+
+interface RetailerFeedOptions extends RequestOptions {
+  feedUrl?: string;
+  apiKey?: string;
+}
+
+interface RetailerFeedItem {
+  title?: string;
+  description?: string;
+  url?: string;
+  upc?: string;
+  priceCents?: number;
+  shippingCents?: number;
+  imageUrl?: string;
+}
+
+interface CostcoItem extends RetailerFeedItem {
+  itemNumber?: string | number;
+  brand?: string;
+  category?: string;
+  price?: number | string;
+  inStock?: boolean;
+  onlineAvailable?: boolean;
+  warehouseId?: string | number;
+  limitPerMember?: number;
+}
+
+export class CostcoConnector implements SupplyConnector {
+  readonly name = 'Costco Wholesale';
+  readonly source = 'costco';
+  readonly supportsAutoCheckout = false;
+  readonly pollIntervalMs = 60_000;
+  private readonly feedUrl?: string;
+  private readonly apiKey?: string;
+  private readonly warehouseId?: string;
+  private readonly request: RequestOptions;
+
+  constructor(options: RetailerFeedOptions & { warehouseId?: string } = {}) {
+    this.feedUrl = configuredFeedUrl(options.feedUrl ?? process.env.COSTCO_FEED_URL, 'COSTCO_FEED_URL');
+    this.apiKey = (options.apiKey ?? process.env.COSTCO_API_KEY)?.trim();
+    this.warehouseId = (options.warehouseId ?? process.env.COSTCO_WAREHOUSE_ID)?.trim();
+    this.request = {
+      fetchFn: options.fetchFn,
+      rateLimiter: options.rateLimiter ?? new TokenBucketRateLimiter({ capacity: 1, refillPerSecond: 2 }),
+    };
+  }
+
+  isEnabled(): boolean {
+    return Boolean(this.feedUrl);
+  }
+
+  async fetchListings(skus: CanonicalSku[]): Promise<RawListing[]> {
+    if (!this.feedUrl) return [];
+    const feedUrl = new URL(this.feedUrl);
+    if (this.warehouseId) feedUrl.searchParams.set('warehouseId', this.warehouseId);
+    const headers = new Headers({ Accept: 'application/json' });
+    if (this.apiKey) headers.set('Authorization', `Bearer ${this.apiKey}`);
+    const response = await fetchWithBackoff(feedUrl.href, { headers, redirect: 'error' }, this.request);
+    const { items, products } = await response.json() as { items?: CostcoItem[]; products?: CostcoItem[] };
+    const upcs = new Set(skus.map(sku => sku.upc).filter(Boolean));
+    const now = new Date().toISOString();
+    const listings: RawListing[] = [];
+    for (const item of items ?? products ?? []) {
+      if (!item || item.inStock === false || item.onlineAvailable === false) continue;
+      const { itemNumber, title, upc } = item;
+      const url = httpsUrl(item.url);
+      const cents = item.priceCents ?? priceCents(item.price);
+      const shippingCents = item.shippingCents ?? 0;
+      if (!itemNumber || !title?.trim() || !url || cents === undefined || !Number.isSafeInteger(cents) || cents <= 0
+        || !Number.isSafeInteger(shippingCents) || shippingCents < 0) continue;
+      if (!upcs.has(upc) && !/\bpok[eé]mon\b/i.test([title, item.brand, item.category].join(' '))) continue;
+      listings.push({
+        listingId: String(itemNumber), source: this.source, title, description: item.description ?? '',
+        url: url.href, upc, priceCents: cents, shippingCents, currency: 'USD', quantity: 1,
+        conditionHint: 'SEALED', imageUrls: item.imageUrl ? [item.imageUrl] : [],
+        seller: firstPartyRetailerSeller('costco-wholesale', this.name),
+        supportsAutoCheckout: false, listedAt: now, fetchedAt: now,
+        metadata: {
+          itemNumber, warehouseId: item.warehouseId ?? this.warehouseId,
+          limitPerMember: item.limitPerMember, membershipRequired: true,
+        },
+      });
+    }
+    return listings;
+  }
+}
+
+interface PokemonCenterProduct extends RetailerFeedItem {
+  productSku?: string;
+  sku?: string;
+  available?: boolean;
+  availability?: string;
+  exclusive?: boolean;
+  purchaseLimit?: number;
+}
+
+export class PokemonCenterConnector implements SupplyConnector {
+  readonly name = 'Pokémon Center';
+  readonly source = 'pokemon_center';
+  readonly supportsAutoCheckout = false;
+  readonly pollIntervalMs = 45_000;
+  private readonly feedUrl?: string;
+  private readonly apiKey?: string;
+  private readonly region: string;
+  private readonly request: RequestOptions;
+
+  constructor(options: RetailerFeedOptions & { region?: string } = {}) {
+    this.feedUrl = configuredFeedUrl(options.feedUrl ?? process.env.POKEMON_CENTER_FEED_URL, 'POKEMON_CENTER_FEED_URL');
+    this.apiKey = (options.apiKey ?? process.env.POKEMON_CENTER_API_KEY)?.trim();
+    this.region = (options.region ?? process.env.POKEMON_CENTER_REGION)?.trim() || 'US';
+    this.request = {
+      fetchFn: options.fetchFn,
+      rateLimiter: options.rateLimiter ?? new TokenBucketRateLimiter({ capacity: 1, refillPerSecond: 2 }),
+    };
+  }
+
+  isEnabled(): boolean {
+    return Boolean(this.feedUrl);
+  }
+
+  async fetchListings(_skus: CanonicalSku[]): Promise<RawListing[]> {
+    if (!this.feedUrl) return [];
+    const headers = new Headers({ Accept: 'application/json', 'X-Pokemon-Center-Region': this.region });
+    if (this.apiKey) headers.set('Authorization', `Bearer ${this.apiKey}`);
+    const response = await fetchWithBackoff(this.feedUrl, { headers, redirect: 'error' }, this.request);
+    const { products, items } = await response.json() as { products?: PokemonCenterProduct[]; items?: PokemonCenterProduct[] };
+    const now = new Date().toISOString();
+    const listings: RawListing[] = [];
+    for (const product of products ?? items ?? []) {
+      if (!product) continue;
+      const { available, availability, title, priceCents: cents, upc } = product;
+      if (available === false || availability === 'out_of_stock' || availability === 'sold_out') continue;
+      if (available !== true && availability !== 'in_stock' && availability !== 'preorder') continue;
+      const productSku = product.productSku ?? product.sku;
+      const url = httpsUrl(product.url);
+      const shippingCents = product.shippingCents ?? 0;
+      if (!productSku || !title?.trim() || !url || cents === undefined || !Number.isSafeInteger(cents) || cents <= 0
+        || !Number.isSafeInteger(shippingCents) || shippingCents < 0) continue;
+      listings.push({
+        listingId: productSku, source: this.source, title, description: product.description ?? '',
+        url: url.href, upc, priceCents: cents, shippingCents, currency: 'USD', quantity: 1,
+        conditionHint: 'SEALED', imageUrls: product.imageUrl ? [product.imageUrl] : [],
+        seller: firstPartyRetailerSeller('pokemon-center', this.name),
+        supportsAutoCheckout: false, listedAt: now, fetchedAt: now,
+        metadata: { productSku, exclusive: product.exclusive, availability, purchaseLimit: product.purchaseLimit, region: this.region },
+      });
     }
     return listings;
   }

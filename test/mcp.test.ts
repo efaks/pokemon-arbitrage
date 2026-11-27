@@ -152,10 +152,10 @@ test('MCP workflow completes scans, human approvals, QC, exit planning, and a sa
   const scan = await data<{
     summary: { fetchedCount: number; autoBoughtCount: number }; pendingHitlOrders: PurchaseOrder[]; filledOrders: PurchaseOrder[];
   }>('run_scan_cycle', { useMock: true });
-  assert.equal(scan.summary.fetchedCount, 15);
+  assert.equal(scan.summary.fetchedCount, 17);
   assert.equal(scan.summary.autoBoughtCount, 0);
-  assert.ok(runtime.db.listSkus().length > 0);
-  assert.ok(scan.pendingHitlOrders.length > 0);
+  assert.equal(runtime.db.listSkus().length, 20);
+  assert.equal(scan.pendingHitlOrders.length, 8);
   assert.deepEqual(scan.filledOrders, []);
 
   const { decisions } = await data<{ decisions: Array<{ action: string }> }>('list_decisions', { action: 'skip', limit: 2 });
@@ -236,7 +236,7 @@ test('MCP fixture scan waits for a running regular scan before selecting the fix
   const mock = data<{ summary: { fetchedCount: number } }>('run_scan_cycle', { useMock: true });
   complete();
   assert.equal((await regular).fetchedCount, 0);
-  assert.equal((await mock).summary.fetchedCount, 15);
+  assert.equal((await mock).summary.fetchedCount, 17);
 });
 
 test('MCP evaluates a listing without side effects and can persist decisions without placing orders', async t => {
@@ -385,7 +385,7 @@ test('spawned MCP stdio CLI flushes every JSON-RPC response at EOF with clean st
   assert.equal(result<{ tools: McpToolDefinition[] }>(responses[2]).tools.length, 21);
   const scan = result<McpToolCallResult>(responses[3]);
   assert.equal(scan.isError, undefined);
-  assert.equal((scan.structuredContent?.summary as { fetchedCount: number }).fetchedCount, 15);
+  assert.equal((scan.structuredContent?.summary as { fetchedCount: number }).fetchedCount, 17);
   const state = result<McpToolCallResult>(responses[4]);
   assert.equal((state.structuredContent?.metrics as { systemState: { operatingMode: string } }).systemState.operatingMode, 'live');
   const pushed = result<McpToolCallResult>(responses[5]);

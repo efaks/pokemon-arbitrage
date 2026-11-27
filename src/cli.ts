@@ -6,7 +6,9 @@ import type { ArbitrageConfig } from './config.ts';
 import type { SupplyConnector } from './connectors/base.ts';
 import { EbayBrowseConnector } from './connectors/ebayConnector.ts';
 import { MockScenarioConnector } from './connectors/mockScenarioConnector.ts';
-import { BestBuyApiConnector, ShopifyStorefrontConnector, TcgplayerFeedConnector } from './connectors/retailerConnectors.ts';
+import {
+  BestBuyApiConnector, CostcoConnector, PokemonCenterConnector, ShopifyStorefrontConnector, TcgplayerFeedConnector,
+} from './connectors/retailerConnectors.ts';
 import { ArbitrageDatabase } from './db/database.ts';
 import { RiskEngine } from './decision/riskEngine.ts';
 import { formatUsd } from './domain/money.ts';
@@ -68,7 +70,10 @@ export function createSystemRuntime(options: SystemRuntimeOptions = {}): SystemR
 
     const connectors = options.useMock
       ? [new MockScenarioConnector()]
-      : [new EbayBrowseConnector(), new BestBuyApiConnector(), new ShopifyStorefrontConnector(), new TcgplayerFeedConnector()];
+      : [
+        new EbayBrowseConnector(), new BestBuyApiConnector(), new CostcoConnector(), new PokemonCenterConnector(),
+        new ShopifyStorefrontConnector(), new TcgplayerFeedConnector(),
+      ];
     const certVerifier = options.useMock ? new MockCertVerifier() : new PsaHttpCertVerifier();
     const resolver = new EntityResolver({ config, certVerifier });
     const fmvEngine = new FmvEngine();

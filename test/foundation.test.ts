@@ -142,7 +142,7 @@ test('creates parent directories, enables file-backed WAL, and persists across c
 test('seeds deterministic comps and leaves their timestamps intact on a later run', t => {
   const db = openDb(t);
   const result = seedCanonicalCatalog(db, new Date(NOW));
-  assert.deepEqual(result, { skusSeeded: 18, compsSeeded: 182 });
+  assert.deepEqual(result, { skusSeeded: 20, compsSeeded: 202 });
   const savedComps = db.listSkus().flatMap(sku => db.getSoldComps(sku.id));
   assert.equal(savedComps.length, result.compsSeeded);
   assert.ok(savedComps.every(comp => comp.totalPriceCents === comp.soldPriceCents + comp.shippingCents));
@@ -166,6 +166,8 @@ test('seeds deterministic comps and leaves their timestamps intact on a later ru
   assert.ok(Math.max(...lp.map(comp => comp.totalPriceCents)) < Math.min(...nm.map(comp => comp.totalPriceCents)));
   assert.equal(db.getSoldComps('graded-cgc10-swsh12-186', 'NM', 'CGC', '10').length, 10);
   assert.equal(db.getSoldComps('graded-cgc10-swsh12-186', undefined, 'PSA').length, 0);
+  assert.equal(db.getSoldComps('sealed-pre-pc-etb', 'SEALED').length, 10);
+  assert.equal(db.getSoldComps('sealed-151-costco-bundle', 'SEALED').length, 10);
 
   const vintage = db.getSoldComps('raw-en-vintage-promo-snap');
   assert.equal(vintage.length, 2);
@@ -177,7 +179,7 @@ test('looks up exact UPCs, filters SKUs, and preserves SKU creation time on upda
   const sku = db.findSkuByUpc('820650853210');
   assert.equal(sku?.id, SKU_ID);
   assert.equal(db.findSkuByUpc('000000000000'), undefined);
-  assert.equal(db.listSkus({ assetClass: 'sealed' }).length, 5);
+  assert.equal(db.listSkus({ assetClass: 'sealed' }).length, 7);
   const [japaneseCharizard] = db.listSkus({ assetClass: 'raw', language: 'JP' });
   assert.equal(japaneseCharizard?.cardNumber, '201/165');
   assert.ok(japaneseCharizard?.aliases.includes('sv2a 199/165'));

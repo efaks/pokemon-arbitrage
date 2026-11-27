@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import type { TestContext } from 'node:test';
+import { createSystemRuntime } from '../src/cli.ts';
 import { createConfig } from '../src/config.ts';
 import type { ArbitrageConfig } from '../src/config.ts';
 import { seedCanonicalCatalog } from '../src/catalog/seed.ts';
@@ -9,13 +10,18 @@ import { ArbitrageDatabase } from '../src/db/database.ts';
 import { fetchWithBackoff, TokenBucketRateLimiter } from '../src/connectors/base.ts';
 import type { FetchLike } from '../src/connectors/base.ts';
 import { EbayBrowseConnector } from '../src/connectors/ebayConnector.ts';
-import { BestBuyApiConnector, ShopifyStorefrontConnector, TcgplayerFeedConnector } from '../src/connectors/retailerConnectors.ts';
+import {
+  BestBuyApiConnector, CostcoConnector, PokemonCenterConnector, ShopifyStorefrontConnector, TcgplayerFeedConnector,
+} from '../src/connectors/retailerConnectors.ts';
 import { MockScenarioConnector } from '../src/connectors/mockScenarioConnector.ts';
+import { RiskEngine } from '../src/decision/riskEngine.ts';
 import { percentOfCents } from '../src/domain/money.ts';
 import type { ArbitrageDecision, CanonicalSku, RawListing } from '../src/domain/types.ts';
 import { EbayOrderApiExecutor, ExecutionCoordinator, ShadowExecutor, SimulatedApiExecutor } from '../src/execution/executor.ts';
 import type { ExecutionAdapter } from '../src/execution/executor.ts';
+import { EntityResolver } from '../src/matching/entityResolver.ts';
 import { WebhookNotifier } from '../src/notifications/notifier.ts';
+import { FmvEngine } from '../src/valuation/fmvEngine.ts';
 
 function fixture(t: TestContext) {
   const db = new ArbitrageDatabase(':memory:');
@@ -146,6 +152,175 @@ test('Best Buy queries sealed UPCs and returns only available products with usab
   const listings = await connector.fetchListings([sku, secondSku, rawSku]);
   assert.deepEqual(listings.map(listing => [listing.listingId, listing.priceCents]), [['1', 9525], ['2', 5499]]);
   assert.ok(listings.every(listing => listing.source === 'bestbuy' && !listing.supportsAutoCheckout));
+  assert.equal(listings[0].seller.feedbackScore, 10_000);
+});
+
+async function assertRetailerReview(db: ArbitrageDatabase, listing: RawListing, sku: CanonicalSku, anomaly: boolean) {
+  const config = createConfig({ maxAnomalyDiscount: 0.60 });
+  db.setOperatingMode('live');
+  const match = await new EntityResolver({ config }).resolve(listing, db.listSkus());
+  assert.equal(match.status, 'matched');
+  assert.equal(match.skuId, sku.id);
+  assert.equal(match.matchedCondition, 'SEALED');
+  assert.equal(match.sellerTrust.trusted, true);
+  const valuation = new FmvEngine().evaluate(sku, db.getSoldComps(sku.id), config);
+  const decision = new RiskEngine().decide({
+    listing, match, valuation, config, portfolio: db.getPortfolioSnapshot(config), systemState: db.getSystemState(),
+  });
+  assert.equal(decision.action, 'hitl_review');
+  assert.equal(decision.intendedAction, 'hitl_review');
+  assert.equal(decision.anomalyFlagged, anomaly);
+  assert.ok(decision.warnings.some(warning => /sanctioned automated checkout/.test(warning)));
+  assert.equal(decision.warnings.some(warning => /anomaly/i.test(warning)), anomaly);
+}
+
+test('Costco filters authorized warehouse items and returns trusted manual checkout leads', async t => {
+  const { db } = fixture(t);
+  const sku = db.getSku('sealed-151-costco-bundle');
+  assert.ok(sku);
+  const item = {
+    itemNumber: 151500, title: 'Scarlet & Violet 151 Mini Tins 5-Pack', upc: sku.upc,
+    url: 'https://www.costco.com/card-bundle.html', price: '37.99', limitPerMember: 2,
+  };
+  const fetchFn: FetchLike = async (input, init) => {
+    const url = new URL(String(input));
+    assert.equal(url.searchParams.get('warehouseId'), '0123');
+    assert.equal(url.searchParams.get('category'), 'toys');
+    assert.equal(new Headers(init?.headers).get('Authorization'), 'Bearer costco-key');
+    assert.equal(init?.redirect, 'error');
+    return Response.json({ items: [
+      item,
+      { ...item, itemNumber: 'brand-match', upc: undefined, brand: 'Pokémon', warehouseId: '0456', shippingCents: 299 },
+      { ...item, itemNumber: 'category-match', upc: undefined, category: 'Pokemon Trading Cards', priceCents: 4050 },
+      { ...item, itemNumber: 'title-match', upc: undefined, title: 'Pokémon 151 Mini Tins 5-Pack' },
+      { ...item, itemNumber: 'non-pokemon', upc: undefined },
+      { ...item, itemNumber: 'unavailable', inStock: false, onlineAvailable: true },
+      { ...item, itemNumber: 'pickup-only', onlineAvailable: false },
+      { ...item, itemNumber: 'insecure', url: 'http://www.costco.com/item' },
+      { ...item, itemNumber: 'credentials', url: 'https://checkout:secret@www.costco.com/item' },
+      { ...item, itemNumber: 'invalid-url', url: '/item' },
+      { ...item, itemNumber: 'free', price: 0 },
+      { ...item, itemNumber: 'negative', priceCents: -1 },
+    ] });
+  };
+  const connector = new CostcoConnector({
+    feedUrl: 'https://feed.example.test/costco?category=toys', apiKey: 'costco-key', warehouseId: '0123', fetchFn,
+  });
+  assert.equal(connector.isEnabled(), true);
+  assert.equal(connector.pollIntervalMs, 60_000);
+  const listings = await connector.fetchListings(db.listSkus());
+  assert.deepEqual(listings.map(listing => [listing.listingId, listing.priceCents, listing.shippingCents]), [
+    ['151500', 3799, 0], ['brand-match', 3799, 299], ['category-match', 4050, 0], ['title-match', 3799, 0],
+  ]);
+  const [listing, brandMatch] = listings;
+  assert.equal(listing.source, 'costco');
+  assert.equal(listing.url, item.url);
+  assert.equal(listing.supportsAutoCheckout, false);
+  assert.deepEqual(listing.seller, {
+    sellerId: 'costco-wholesale', username: 'Costco Wholesale', feedbackScore: 10_000, positivePercent: 99.9,
+    accountAgeDays: 3650, returnsAccepted: true,
+  });
+  assert.deepEqual(listing.metadata, { itemNumber: 151500, warehouseId: '0123', limitPerMember: 2, membershipRequired: true });
+  assert.equal(brandMatch.metadata?.warehouseId, '0456');
+  await assertRetailerReview(db, listing, sku, false);
+});
+
+test('Pokémon Center accepts in-stock items and preorders and flags the exclusive ETB discount for review', async t => {
+  const { db } = fixture(t);
+  const sku = db.getSku('sealed-pre-pc-etb');
+  assert.ok(sku);
+  const product = {
+    title: sku.name, url: 'https://www.pokemoncenter.com/product/pre-etb',
+    priceCents: 5999, upc: sku.upc, exclusive: true, purchaseLimit: 1,
+  };
+  const fetchFn: FetchLike = async (input, init) => {
+    assert.equal(String(input), 'https://feed.example.test/pokemon-center');
+    const headers = new Headers(init?.headers);
+    assert.equal(headers.get('Authorization'), 'Bearer pc-key');
+    assert.equal(headers.get('X-Pokemon-Center-Region'), 'US');
+    assert.equal(init?.redirect, 'error');
+    return Response.json({ products: [
+      { ...product, productSku: 'pre-etb', availability: 'preorder' },
+      { ...product, sku: 'stock', availability: 'in_stock' },
+      { ...product, sku: 'available', available: true },
+      { ...product, sku: 'missing-availability' },
+      { ...product, sku: 'unavailable', available: false, availability: 'preorder' },
+      { ...product, sku: 'out', available: true, availability: 'out_of_stock' },
+      { ...product, sku: 'sold-out', availability: 'sold_out' },
+      { ...product, sku: 'http', available: true, url: 'http://www.pokemoncenter.com/product/pre-etb' },
+      { ...product, sku: 'credentials', available: true, url: 'https://:secret@www.pokemoncenter.com/product/pre-etb' },
+      { ...product, sku: 'invalid-url', available: true, url: 'not a URL' },
+      { ...product, sku: 'fractional', available: true, priceCents: 5999.5 },
+      { ...product, sku: 'string-cents', available: true, priceCents: '5999' },
+      { ...product, sku: 'free', available: true, priceCents: 0 },
+    ] });
+  };
+  const connector = new PokemonCenterConnector({
+    feedUrl: 'https://feed.example.test/pokemon-center', apiKey: 'pc-key', region: 'US', fetchFn,
+  });
+  assert.equal(connector.isEnabled(), true);
+  assert.equal(connector.pollIntervalMs, 45_000);
+  const listings = await connector.fetchListings(db.listSkus());
+  assert.deepEqual(listings.map(listing => listing.listingId), ['pre-etb', 'stock', 'available']);
+  const [listing] = listings;
+  assert.equal(listing.source, 'pokemon_center');
+  assert.equal(listing.url, product.url);
+  assert.equal(listing.priceCents, 5999);
+  assert.equal(listing.supportsAutoCheckout, false);
+  assert.deepEqual(listing.seller, {
+    sellerId: 'pokemon-center', username: 'Pokémon Center', feedbackScore: 10_000, positivePercent: 99.9,
+    accountAgeDays: 3650, returnsAccepted: true,
+  });
+  assert.deepEqual(listing.metadata, {
+    productSku: 'pre-etb', exclusive: true, availability: 'preorder', purchaseLimit: 1, region: 'US',
+  });
+  await assertRetailerReview(db, listing, sku, true);
+});
+
+test('Costco and Pokémon Center reject invalid, insecure, or credentialed feed URLs', () => {
+  for (const feedUrl of ['invalid', 'http://feed.example.test', 'https://user@feed.example.test', 'https://:secret@feed.example.test']) {
+    assert.throws(() => new CostcoConnector({ feedUrl }), /COSTCO_FEED_URL must be an HTTPS URL/);
+    assert.throws(() => new PokemonCenterConnector({ feedUrl }), /POKEMON_CENTER_FEED_URL must be an HTTPS URL/);
+  }
+});
+
+test('live runtime enables retailer feeds from environment settings and accepts alternate array names', async t => {
+  const settings = {
+    COSTCO_FEED_URL: 'https://feed.example.test/costco', COSTCO_API_KEY: '', COSTCO_WAREHOUSE_ID: '0123',
+    POKEMON_CENTER_FEED_URL: 'https://feed.example.test/pokemon-center', POKEMON_CENTER_API_KEY: '',
+    POKEMON_CENTER_REGION: '',
+  };
+  for (const [key, value] of Object.entries(settings)) {
+    const previous = process.env[key];
+    process.env[key] = value;
+    t.after(() => {
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    });
+  }
+  t.mock.method(globalThis, 'fetch', (input: string, init?: RequestInit) => {
+    const url = new URL(input);
+    const headers = new Headers(init?.headers);
+    assert.equal(headers.get('Authorization'), null);
+    if (url.pathname === '/costco') {
+      assert.equal(url.searchParams.get('warehouseId'), '0123');
+      return Response.json({ products: [
+        { itemNumber: '123', title: 'Pokemon TCG 151 Mini Tin Bundle', url: 'https://www.costco.com/item', priceCents: 3799 },
+      ] });
+    }
+    assert.equal(url.href, settings.POKEMON_CENTER_FEED_URL);
+    assert.equal(headers.get('X-Pokemon-Center-Region'), 'US');
+    return Response.json({ items: [{
+      productSku: '456', title: 'Pokémon Center ETB', url: 'https://www.pokemoncenter.com/product/456',
+      priceCents: 5999, available: true,
+    }] });
+  });
+  const runtime = createSystemRuntime({ dbPath: ':memory:' });
+  t.after(() => runtime.db.close());
+  const connectors = runtime.connectors.filter(connector => connector.source === 'costco' || connector.source === 'pokemon_center');
+  assert.deepEqual(connectors.filter(connector => connector.isEnabled()).map(connector => connector.source), ['costco', 'pokemon_center']);
+  const listings = await Promise.all(connectors.map(connector => connector.fetchListings([])));
+  assert.deepEqual(listings.map(items => items.map(item => item.listingId)), [['123'], ['456']]);
 });
 
 test('Shopify filters authorized feed variants by game and availability', async t => {
@@ -207,6 +382,8 @@ test('unconfigured connectors return an empty feed without network access', asyn
   const connectors = [
     new EbayBrowseConnector({ accessToken: '', fetchFn }),
     new BestBuyApiConnector({ apiKey: '', fetchFn }),
+    new CostcoConnector({ feedUrl: '', fetchFn }),
+    new PokemonCenterConnector({ feedUrl: '', fetchFn }),
     new ShopifyStorefrontConnector({ storeDomain: '', fetchFn }),
     new TcgplayerFeedConnector({ accessToken: '', fetchFn }),
   ];
@@ -216,22 +393,26 @@ test('unconfigured connectors return an empty feed without network access', asyn
   }
 });
 
-test('mock feed returns 15 distinct and repeatable listings with the shared certs and scenario hints', async () => {
+test('mock feed returns 17 distinct and repeatable listings with the shared certs and scenario hints', async () => {
   const connector = new MockScenarioConnector();
   const listings = await connector.fetchListings([]);
   assert.equal(connector.isEnabled(), true);
   assert.equal(connector.supportsAutoCheckout, true);
   assert.deepEqual(listings, await connector.fetchListings([]));
   const byId = new Map(listings.map(listing => [listing.listingId, listing]));
-  assert.equal(listings.length, 15);
-  assert.equal(byId.size, 15);
-  assert.ok(listings.every(listing => listing.source === 'mock_feed' && Number.isSafeInteger(listing.priceCents)));
+  assert.equal(listings.length, 17);
+  assert.equal(byId.size, 17);
+  assert.ok(listings.every(listing => Number.isSafeInteger(listing.priceCents)));
+  assert.equal(listings.filter(listing => listing.source === 'mock_feed').length, 15);
+  assert.equal(byId.get('mock-costco-151-tins')?.source, 'costco');
+  assert.equal(byId.get('mock-pc-pre-etb')?.source, 'pokemon_center');
   assert.deepEqual(listings.map(listing => [listing.listingId, listing.priceCents]), [
     ['mock-ssp-bb-clean', 9500], ['mock-lugia-cgc10-clean', 28500], ['mock-pre-etb-retailer', 5499],
     ['mock-moonbreon-psa10-highcap', 82000], ['mock-zard-raw-nm', 13000], ['mock-evs-bb-anomaly', 21000],
     ['mock-zard-cert-mismatch', 42000], ['mock-zard-proxy-trap', 4500], ['mock-evs-empty-box', 3000],
     ['mock-zard-jp-sv2a', 11500], ['mock-zard-006-holo', 2500], ['mock-crz-sketchy-seller', 3500],
     ['mock-snap-illiquid', 35000], ['mock-151-thin-margin', 4200], ['mock-digital-code-trap', 1000],
+    ['mock-costco-151-tins', 3799], ['mock-pc-pre-etb', 5999],
   ]);
   assert.deepEqual(listings.flatMap(listing => listing.certNumber
     ? [[listing.listingId, listing.certNumber, listing.graderHint, listing.gradeHint]] : []), [

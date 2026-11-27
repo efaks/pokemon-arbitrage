@@ -130,6 +130,20 @@ const CATALOG: CatalogEntry[] = [
     cardNumber: 'SNAP-01', language: 'EN', variant: 'promo', fmvCents: 60000,
     aliases: ['Snap Pikachu', 'Pikachu SNAP Photo Contest Promo'],
   },
+  {
+    id: 'sealed-pre-pc-etb',
+    name: 'Pokemon TCG: Prismatic Evolutions Pokemon Center Elite Trainer Box',
+    assetClass: 'sealed', setName: 'Prismatic Evolutions', setCode: 'SV8pt5',
+    upc: '820650859434', msrpCents: 5999, language: 'EN', variant: 'promo', fmvCents: 23500,
+    aliases: ['Prismatic Evolutions Pokemon Center ETB', 'Prismatic Evolutions PC ETB', 'PRE Pokemon Center Elite Trainer Box'],
+  },
+  {
+    id: 'sealed-151-costco-bundle',
+    name: 'Pokemon TCG: Scarlet & Violet 151 Mini Tins 5-Pack Costco Bundle',
+    assetClass: 'sealed', setName: 'Scarlet & Violet 151', setCode: 'SV3pt5',
+    upc: '820650859991', msrpCents: 3799, language: 'EN', variant: 'standard', fmvCents: 9200,
+    aliases: ['Pokemon 151 Mini Tins 5-Pack Bundle', 'Costco Pokemon 151 Mini Tins 5 Pack', '151 5-Pack Mini Tin Bundle'],
+  },
 ];
 
 const REGULAR_COMP_AGES = [2, 4, 7, 10, 14, 18, 23, 29, 42, 56];

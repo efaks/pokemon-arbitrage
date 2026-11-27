@@ -4,7 +4,7 @@ A local TypeScript system that scans marketplace and retailer listings, estimate
 
 ## Architecture
 
-1. **Supply connectors** normalize configured eBay, Best Buy, Shopify storefront, and TCGplayer feeds into USD listings. The pipeline deduplicates unchanged listings before evaluation. The mock connector provides a repeatable fixture feed.
+1. **Supply connectors** normalize configured eBay, Best Buy, Costco Wholesale, Pokémon Center, Shopify storefront, and TCGplayer feeds into USD listings. The pipeline deduplicates unchanged listings before evaluation. The mock connector provides a repeatable fixture feed.
 2. **Catalog and matching** resolve listings to canonical SKUs using identifiers and listing text. The resolver checks seller reputation, print and language variants, condition, certification, and listing red flags.
 3. **Valuation and risk** use recent comparable sales and an outlier-trimmed, time-weighted median. The risk engine evaluates liquidity and expected net profit across eBay, TCGplayer, Cardmarket, and buylist exits, accounting for tax, shipping, fees, packaging, and risk reserves.
 4. **Execution** applies the operating mode, records decisions and orders, and rechecks availability and cost before sanctioned API checkout. SQLite backs purchase locks, idempotency, order history, and the audit trail.
@@ -153,6 +153,17 @@ Retrieve a prompt with `prompts/get`.
 | `incident_triage` | System state, kill switch status, recent audit events, and failed orders. |
 | `autopilot_optimization` | Buy Book tiers, alpha telemetry, settings, and system state. |
 
+## Costco Wholesale and Pokémon Center feeds
+
+Use an authorized HTTPS JSON feed for each retailer. Feed URLs and product links require HTTPS without embedded credentials. Feed requests reject redirects. Both connectors provide listing links for human review and manual checkout.
+
+| Source | Feed format and filtering |
+| --- | --- |
+| Costco Wholesale (`costco`) | Returns an `items` or `products` array. Each item supplies `itemNumber`, `title`, `url`, and a positive `priceCents` or a USD `price`. The connector filters for Pokémon by catalog UPC or text in the title, brand, or category. It skips out-of-stock items and items unavailable online. Review the warehouse, membership requirement, and any per-member limit before checkout. |
+| Pokémon Center (`pokemon_center`) | Returns a `products` or `items` array. Each product supplies `productSku` (or `sku`), `title`, `url`, and a positive integer `priceCents`. The connector accepts `available: true`, `in_stock`, and `preorder`, and skips listings marked unavailable, out of stock, or sold out. Listing metadata includes region and any supplied exclusivity, availability, or purchase limit fields. |
+
+Both feeds accept optional `upc`, `description`, `imageUrl`, and `shippingCents` fields. Prices are in USD. Shipping defaults to zero if the feed omits it. Verify final cost and availability when reviewing the listing.
+
 ## Environment variables
 
 Export connector credentials for the process that launches the CLI or MCP server.
@@ -162,6 +173,12 @@ Export connector credentials for the process that launches the CLI or MCP server
 | `EBAY_ACCESS_TOKEN` | eBay Browse API access. |
 | `EBAY_ORDER_API_TOKEN` | eBay Order API checkout access. |
 | `BESTBUY_API_KEY` | Best Buy catalog API access. |
+| `COSTCO_FEED_URL` | Authorized Costco HTTPS JSON feed. Set this to enable the connector. |
+| `COSTCO_API_KEY` | Optional bearer token for the Costco feed. |
+| `COSTCO_WAREHOUSE_ID` | Optional Costco `warehouseId` query parameter. |
+| `POKEMON_CENTER_FEED_URL` | Authorized Pokémon Center HTTPS JSON feed. Set this to enable the connector. |
+| `POKEMON_CENTER_API_KEY` | Optional bearer token for the Pokémon Center feed. |
+| `POKEMON_CENTER_REGION` | Region sent in `X-Pokemon-Center-Region`. Defaults to `US`. |
 | `LGS_SHOPIFY_DOMAINS` | Comma- or whitespace-separated Shopify storefront domains. |
 | `TCGPLAYER_API_TOKEN` | TCGplayer pricing feed access. |
 | `PSA_API_TOKEN` | PSA certificate lookup. |
