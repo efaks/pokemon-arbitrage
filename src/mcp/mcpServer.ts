@@ -12,7 +12,10 @@ import type { RawListing, SoldComp } from '../domain/types.ts';
 import { AutopilotEngine } from '../engine/autopilot.ts';
 import { evaluateReadiness } from '../engine/readiness.ts';
 import type { McpHttpHandler } from '../server/httpServer.ts';
-import { buildSetupGuide, providerConnectionTargets, testProviderConnection, updateProjectEnv } from '../setup/configManager.ts';
+import {
+  buildSetupGuide, providerConnectionTargets, SETUP_PROFILES, SETUP_STEP_IDS, SetupWorkflowInputError,
+  testProviderConnection, updateProjectEnv, updateSetupWorkflow,
+} from '../setup/configManager.ts';
 import { buildEbayConsentUrl, createDefaultMerchantLocation, discoverEbaySellerSetup,
   exchangeEbayAuthorizationCode, sellerSetupTokenProvider } from '../setup/ebayOnboarding.ts';
 import { redactSecrets, rememberSecret } from '../setup/secrets.ts';
@@ -77,6 +80,11 @@ const money = integer(0);
 const positiveMoney = integer(1);
 const limit = integer(1);
 const noArgs = object({});
+const setupStep = { type: 'string', enum: SETUP_STEP_IDS } as const;
+const setupWorkflowSchema = object({
+  targetProfile: { type: 'string', enum: SETUP_PROFILES } as const,
+  acknowledgeStep: setupStep, note: text, skipStep: setupStep, reason: text, clearStep: setupStep, reset: boolean,
+});
 
 class InvalidParams extends Error {}
 
@@ -230,6 +238,10 @@ function webhookListing(fields: SchemaValue<typeof httpWebhookSchema>): RawListi
 
 export function parseWebhookListing(input: unknown): RawListing {
   return webhookListing(readArgs(httpWebhookSchema, input));
+}
+
+export function parseSetupWorkflowUpdate(input: unknown) {
+  return readArgs(setupWorkflowSchema, input);
 }
 
 const trustedEvaluationSeller: RawListing['seller'] = {
@@ -469,8 +481,19 @@ function makeTools(runtime: SystemRuntime, autopilot: AutopilotEngine): Tool[] {
         const pass = await autopilot.runAutopilotPass({ tier });
         return { sync, pass };
       }),
-    tool('get_setup_guide', 'Read the current onboarding checklist and readiness.', noArgs, readOnly,
+    tool('get_setup_guide', 'Read the interactive onboarding workflow, selected target profile, current step, and readiness.', noArgs, readOnly,
       () => ({ ...buildSetupGuide(runtime) })),
+    tool('update_setup_workflow', 'Checkpoint a target profile, acknowledgement, or skip in SQLite, then return the updated setup guide.',
+      setupWorkflowSchema, { ...localWrite, destructiveHint: false, idempotentHint: true }, args => {
+        try {
+          updateSetupWorkflow(db, args);
+        } catch (error) {
+          if (error instanceof SetupWorkflowInputError) throw new InvalidParams(error.message);
+          if (error instanceof Error) throw new ToolFailure(error.message);
+          throw error;
+        }
+        return { ...buildSetupGuide(runtime) };
+      }),
     tool('configure_settings', 'Write approved project settings to the private .env file and refresh the runtime.',
       object({ settings: settingsSchema, reloadRuntime: boolean }, 'settings'), localWrite, ({ settings, reloadRuntime = true }) => {
         const update = updateProjectEnv(settings as Record<string, string | null>, {
@@ -563,7 +586,7 @@ function makeResources(runtime: SystemRuntime, autopilot: AutopilotEngine): Reso
     resource('telemetry', 'Alpha telemetry', 'Latency, signal counts, and execution outcomes.', () => autopilot.getTelemetry().snapshot(db)),
     resource('readiness', 'Readiness', 'Current operating readiness, configuration, and next actions.',
       () => evaluateReadiness(runtime, { autopilot })),
-    resource('setup-guide', 'Setup guide', 'Interactive onboarding checklist and configuration progress.',
+    resource('setup-guide', 'Setup guide', 'Interactive onboarding workflow with target profiles, saved checkpoints, and readiness.',
       () => buildSetupGuide(runtime)),
   ];
 }
@@ -696,7 +719,7 @@ export class ArbitrageMcpServer {
           return jsonRpcError(id, codes.METHOD_NOT_FOUND, 'Method not found');
       }
     } catch (error) {
-      if (error instanceof InvalidParams) return jsonRpcError(id, codes.INVALID_PARAMS, 'Invalid params', error.message);
+      if (error instanceof InvalidParams) return jsonRpcError(id, codes.INVALID_PARAMS, 'Invalid params', redactSecrets(error.message));
       return jsonRpcError(id, codes.INTERNAL_ERROR, 'Internal error');
     }
   }
@@ -746,13 +769,14 @@ export class ArbitrageMcpServer {
     }
     if (name === 'guided_setup_wizard') {
       return promptResult(prompt, [
-        'Use get_setup_guide and begin at nextSetupStep. Review the database, mode, and kill switch with the operator.',
-        'Install the selected catalog pack. Sync a small batch or import verified sales. Confirm fresh comps before moving on.',
-        'Configure only approved feeds, risk limits, tax, alerts, and verification services. Test each configured provider. Enter secrets locally or through a secure input mechanism. Never repeat credentials or authorization codes in chat or audit notes.',
-        'For eBay, confirm environment, RuName, and approved scopes. Call start_ebay_oauth and send the operator to eBay to sign in and consent. Exchange the code or the redirect URL with complete_ebay_oauth and save only for the intended API.',
-        'Discover seller policies first without saving. Review the IDs, location, and any warehouse address with the operator before autoSave or creation. Use reconcile_ebay_sales to verify fulfillment and review cash.',
-        'Run a shadow pass after authorization and review matching, comps, decisions, orders, reconciliation, and alerts. Confirm live checkout scope and spending limits before changing mode. Enable automatic selling only with separate operator approval.',
-        'Refresh the guide after each step. Keep one process responsible for periodic polling. Stop on an engaged kill switch and resolve it with the operator.',
+        'Call get_setup_guide first and follow workflow.conversationRules. Confirm the database, mode, and kill switch. If profileSelected is false, ask for a targetProfile and checkpoint it with update_setup_workflow, even if the catalog already exists.',
+        'Work one step at a time from currentStep (nextSetupStep). Present its operatorActions and ask only the relevant questionsForUser. Use its agentActions to save decisions as they are confirmed and refresh the guide after each step.',
+        'Use configure_settings to save approved settings inside Muse. Keep credentials and OAuth responses in secure input and never repeat them in chat or notes. Test configured providers with test_provider_connection where supported and verify readiness with check_readiness.',
+        'Use bootstrap_catalog or expand_catalog for the selected catalog. Recommend day-one import_sold_comps with verified CSV or JSON sales to avoid the three-day cold start. Use sync_market_data for a small provider sync and check fresh comps.',
+        'Review cash and spending limits, set ARBITRAGE_SALES_TAX_RATE=0 where the operator confirms their resale certificate applies, and agree on physical receiving, QC, and shipping or vault consignment. Checkpoint confirmed defaults and optional service decisions with update_setup_workflow.',
+        'Offer targetProfile: "hitl_alerts" if production eBay Buy Order API approval is pending. For approved eBay access, confirm the environment, RuName, and scopes. Call start_ebay_oauth, have the operator sign in and consent on eBay, then call complete_ebay_oauth for the intended API.',
+        'Offer a separate Sandbox rehearsal for selling. Start with discover_ebay_policies using autoSave: false. Review policy IDs and the warehouse address before saving or creating a location. Use reconcile_ebay_sales to verify fulfillment and review cash.',
+        'Run an authorized pass in shadow mode, then review matches, comps, margins, traps, alerts, and any paper orders. Stop on an engaged kill switch. Obtain explicit operator approval before setting hitl or live mode and separate approval before setting ARBITRAGE_AUTO_PUBLISH_LISTINGS=true. Verify the target profile and select exactly one 24/7 runner.',
       ].join('\n'), buildSetupGuide(this.runtime));
     }
     if (name === 'autonomous_buyer') {

@@ -35,6 +35,7 @@ import { CompositeNotifier, ConsoleNotifier, NullNotifier, WebhookNotifier } fro
 import { ArbitragePipeline } from './pipeline/arbitragePipeline.ts';
 import { createArbitrageServer } from './server/httpServer.ts';
 import { buildSetupGuide } from './setup/configManager.ts';
+import type { SetupGuideReport } from './setup/configManager.ts';
 import { redactSecrets, rememberConfiguredSecrets } from './setup/secrets.ts';
 import { importSoldComps, parseSoldCompsCsv } from './sync/compImporter.ts';
 import type { ImportCompInput } from './sync/compImporter.ts';
@@ -236,6 +237,35 @@ function printReadiness(report: ReadinessReport): void {
   }
 }
 
+function printSetupGuide(report: SetupGuideReport): void {
+  const { currentStep, workflow, steps, setupProgressPct } = report;
+  const profile = workflow.profiles.find(item => item.id === workflow.targetProfile);
+  const profileStatus = workflow.profileSelected ? 'selected' : 'default';
+  console.log(`Profile: ${profile?.label ?? workflow.targetProfile} (${workflow.targetProfile}, ${profileStatus})`);
+  console.log(`Setup ${setupProgressPct}% complete. Next step: ${currentStep?.title ?? 'Complete!'}`);
+  const statusLabels = { complete: 'DONE', skipped: 'SKIP', blocked: 'BLOCKED', pending: 'WAIT' };
+  for (const step of steps) {
+    const label = step.status === 'pending' && step.id === currentStep?.id ? 'NEXT' : statusLabels[step.status];
+    console.log(`[${label}] ${step.order}. ${step.id} · ${step.title} (${step.phase})`);
+  }
+  if (currentStep) {
+    console.log(`\nCurrent Step · ${currentStep.title}\n${currentStep.summary}\n${currentStep.whyItMatters}`);
+    for (const [heading, items] of [
+      ['Operator actions', currentStep.operatorActions],
+      ['Questions for the operator', currentStep.questionsForUser],
+      ['Resources', currentStep.resources.map(({ label, url }) => `${label} · ${url}`)],
+      ['Muse actions', currentStep.agentActions.map(({ tool, when }) => `${tool} · ${when}`)],
+      ['Verification checks', currentStep.verificationChecks],
+    ] as const) {
+      if (!items.length) continue;
+      console.log('\n' + heading);
+      for (const item of items) console.log('- ' + item);
+    }
+    console.log(`\nCompletion criteria\n${currentStep.completionCriteria}`);
+  }
+  console.log('\nOpen guided_setup_wizard in Muse to continue interactively, or use --json for the full setup guide.');
+}
+
 const usage = `Usage: node src/cli.ts <command>
   demo
   doctor [--db data/arbitrage.sqlite] [--mock] [--json]
@@ -349,13 +379,7 @@ async function main(args: string[]): Promise<void> {
     try {
       const report = buildSetupGuide(runtime);
       if (values.json) console.log(JSON.stringify(report, null, 2));
-      else {
-        console.log(`Setup ${report.setupProgressPct}% complete`);
-        for (const step of report.steps) {
-          console.log(`\n${step.id} (${step.status})`);
-          for (const instruction of step.userInstructions) console.log('- ' + instruction);
-        }
-      }
+      else printSetupGuide(report);
     } finally {
       runtime.db.close();
     }

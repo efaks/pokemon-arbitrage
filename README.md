@@ -78,7 +78,8 @@ In live mode with the kill switch clear, asynchronous repricing pushes eligible 
 | `POST /api/comps/import` | Import historical sales with `comps`, `csv`, or both. |
 | `POST /api/inventory/:id/publish` | Publish a listing with optional `channel`, `listedPriceCents`, `title`, `description`, `imageUrls`, and `pushLive`. |
 | `POST /api/inventory/:id/withdraw` | Withdraw a listing with an optional `reason`. |
-| `GET /api/setup-guide` | Read the current setup checklist and readiness. |
+| `GET /api/setup-guide` | Read the interactive onboarding guide, target profile, checkpoints, and readiness. |
+| `POST /api/setup-guide/workflow` | Select a profile, acknowledge or skip a step with a note or reason, clear a step checkpoint, or reset onboarding. Returns the refreshed guide. |
 | `POST /api/catalog/expand` | Install a catalog `pack` (defaults to `all_curated`). |
 | `POST /api/inventory/reconcile-sales` | Record paid eBay sales. Accepts optional `sinceIso` and `limit` (1–200). |
 
@@ -94,7 +95,7 @@ Supply the source's stable `listingId`, actual seller profile, and checkout capa
 
 ## MCP integration
 
-The server negotiates `2025-03-26` and `2024-11-05`. It exposes 36 tools, 10 resources, and 6 prompts over both transports.
+The server negotiates `2025-03-26` and `2024-11-05`. It exposes 37 tools, 10 resources, and 6 prompts over both transports.
 
 **Stdio.** Launch `node src/cli.ts mcp` directly from a client. The process reads one JSON-RPC frame per line from stdin and writes only JSON-RPC frames to stdout. Use the Node command in client configuration to keep npm's script banner out of the stream.
 
@@ -147,7 +148,8 @@ Use `tools/list` for input schemas and `tools/call` with `params.name` and `para
 | `check_readiness` | Check operating mode, kill switch, comp freshness, feed configuration, and checkout capability. |
 | `bootstrap_catalog` | Upsert the starter SKUs and refresh the Buy Book. Set `includeDemoComps: true` only in a demo database. |
 | `run_autopilot_pass` | Scan, triage, reconcile sales, and reprice. Accepts optional `tier` (`all`, `hot`, `standard`, or `cold`), `syncFirst`, and positive integer `syncLimit`. Returns the pass and optional sync summary. |
-| `get_setup_guide` | Read the eight-step onboarding checklist and current progress. |
+| `get_setup_guide` | Read the eight-step interactive onboarding workflow, target profile, current step, and readiness. |
+| `update_setup_workflow` | Checkpoint `targetProfile`, `acknowledgeStep` with `note`, or `skipStep` with `reason`. Use `clearStep` to remove a step checkpoint or `reset: true` by itself to reset onboarding. Returns the refreshed guide. |
 | `configure_settings` | Store allowlisted `settings` in a private `.env` file. Use `null` to remove a key and `reloadRuntime: false` to defer applying changes. |
 | `start_ebay_oauth` | Build the operator consent URL using the registered RuName and selected scopes. |
 | `complete_ebay_oauth` | Exchange the code or pasted redirect URL and save the refresh token to the selected buy and/or sell settings. |
@@ -173,7 +175,7 @@ Read these JSON snapshots with `resources/read`.
 | `pokemon-arbitrage://buy-book` | SKU buy thresholds, momentum, and polling tiers. |
 | `pokemon-arbitrage://telemetry` | Latency, alpha signal counts, and source execution outcomes. |
 | `pokemon-arbitrage://readiness` | Live readiness report with blockers, warnings, and next actions. |
-| `pokemon-arbitrage://setup-guide` | Interactive setup checklist, progress, and next step. |
+| `pokemon-arbitrage://setup-guide` | Interactive onboarding guide with target profiles, saved checkpoints, progress, and the next step. |
 
 ### Prompts
 
@@ -311,20 +313,26 @@ Check the returned `inserted`, `duplicatesSkipped`, and `rejected` counts. Fresh
 
 ## Guided setup and deployment
 
-Run the setup checklist against the database you plan to use. Install a catalog pack and import or sync verified comparable sales. Use a separate database for simulation.
+Open `guided_setup_wizard` in Muse and confirm the database you plan to use. Muse calls `get_setup_guide` and works through one step at a time using `currentStep`, its operator actions, questions, and verification checks. `update_setup_workflow` saves the selected profile, operator acknowledgements, and allowed skips in SQLite so the guide resumes across sessions. From the CLI, run `setup` for the checklist and current walkthrough or add `--json` for the full report.
 
 ```sh
+npm run --silent setup -- --db data/arbitrage.sqlite
 npm run --silent setup -- --db data/arbitrage.sqlite --json
 npm run --silent expand-catalog -- --pack all_curated --db data/arbitrage.sqlite
 npm run --silent reconcile-sales -- --mock --db :memory:
 ```
 
-Open `guided_setup_wizard` in Muse to walk through the same checklist. Enter credentials privately. The MCP configuration tool preserves unrelated settings, masks secrets in results, and rebuilds the active runtime against the same SQLite connection. Use a dedicated `.env` and SQLite database for sandbox rehearsal. Match the eBay credential environment and `EBAY_SELL_SANDBOX`. Production checkout requires approved eBay Order API access. [eBay consent and token exchange](https://developer.ebay.com/develop/guides/sell/authorization)
+Choose `hitl_alerts` for alerts with operator-managed checkout, including while eBay Buy Order API approval is pending. Choose `live_auto_buy` for approved eBay checkout with operator-managed selling, or `live_closed_loop` to add eBay selling and paid-sale reconciliation. Changing profiles updates which steps are required. The operating mode is set separately after operator approval.
+
+Load the starter or curated catalog, then use `import_sold_comps` on day one with verified CSV or JSON sales to avoid the three-day cold start. Run a small authorized market data sync and verify comp freshness with `check_readiness`. Confirm bankroll, spending caps, and cash reserve, and set `ARBITRAGE_SALES_TAX_RATE=0` where the operator confirms a state resale certificate applies. Agree on physical receiving, intake QC, and shipping or vault consignment.
+
+Use `configure_settings` in Muse for approved settings and enter credentials privately. The tool preserves unrelated settings, masks secrets in results, and rebuilds the active runtime against the same SQLite connection. For seller rehearsal, use a dedicated `.env` and SQLite database with sandbox credentials and `EBAY_SELL_SANDBOX=true`. Production checkout requires approved eBay Order API access. [eBay consent and token exchange](https://developer.ebay.com/develop/guides/sell/authorization)
 
 Call `discover_ebay_policies` before enabling `autoSave`. Review the shipping, payment, and return rules and verify the warehouse is enabled. Fulfillment reconciliation records each matching paid inventory sale once. Review the summary for skipped orders and provider errors. Call reconciliation with a date and a limit up to 200 if the default recent page needs narrowing. [eBay inventory locations](https://developer.ebay.com/api-docs/sell/static/inventory/managing-inventory-locations.html)
 
-Use one active polling daemon per database. The dashboard reuses the database mode and leaves polling off by default. Keep its unauthenticated HTTP interface on a trusted local endpoint.
+Review a shadow pass and confirm the kill switch is clear before requesting explicit approval for the target mode. Obtain separate approval before enabling automatic publication. Select exactly one continuous runner per database from the deployment options below. The dashboard reuses the database mode and leaves polling off by default. Keep its unauthenticated HTTP interface on a trusted local endpoint.
 
 - **Docker Compose** Set up the host `.env`, create `./data` writable by the image's `node` user (UID 1000), and run `docker compose up -d --build`. Both services read the host `.env` at container creation and share `./data`. The dashboard is published on `127.0.0.1:3000`. Apply durable settings through the host file, then run `docker compose up -d --force-recreate`. MCP edits inside a dashboard container affect that process and its local file.
 - **Linux systemd** Edit the unit for the installation directory, service account, and absolute Node 26 path. Give the service account access to `.env` and the database directory. Install the unit in `/etc/systemd/system` and run `systemctl enable --now pokemon-arbitrage`. Use `systemctl reload pokemon-arbitrage` after editing the host file. [service unit](deploy/pokemon-arbitrage.service)
 - **macOS launchd** Edit the LaunchAgent for the checkout and absolute Node 26 path. Place it in `~/Library/LaunchAgents` and use `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pokemon-arbitrage.autopilot.plist`. Use `launchctl kill SIGHUP gui/$(id -u)/com.pokemon-arbitrage.autopilot` after editing the host file. [LaunchAgent plist](deploy/com.pokemon-arbitrage.autopilot.plist)
+- **Scheduled Muse passes** Schedule `run_autopilot_pass` for the approved runtime. Use the schedule as the only polling runner for that database.

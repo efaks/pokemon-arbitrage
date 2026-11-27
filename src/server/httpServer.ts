@@ -3,7 +3,7 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { resolve } from 'node:path';
 import { installCatalogPack, listCatalogPacks } from '../catalog/catalogPacks.ts';
-import { buildSetupGuide } from '../setup/configManager.ts';
+import { buildSetupGuide, updateSetupWorkflow } from '../setup/configManager.ts';
 import { redactSecrets } from '../setup/secrets.ts';
 import type { SystemRuntime } from '../cli.ts';
 import type { ArbitrageConfig } from '../config.ts';
@@ -12,7 +12,7 @@ import { CardCondition, DecisionAction, ExitChannel, OperatingMode, OrderStatus 
 import type { RawListing } from '../domain/types.ts';
 import type { AutopilotEngine } from '../engine/autopilot.ts';
 import { evaluateReadiness } from '../engine/readiness.ts';
-import { parseWebhookListing } from '../mcp/mcpServer.ts';
+import { parseSetupWorkflowUpdate, parseWebhookListing } from '../mcp/mcpServer.ts';
 import { InventoryListingError } from '../liquidation/inventoryManager.ts';
 import type { InventoryManager } from '../liquidation/inventoryManager.ts';
 import type { ArbitragePipeline } from '../pipeline/arbitragePipeline.ts';
@@ -217,6 +217,17 @@ export function createArbitrageServer(options: ArbitrageServerOptions): Server {
       }
 
       switch (pathname) {
+        case '/api/setup-guide/workflow': {
+          const body = await readObject(req);
+          try {
+            updateSetupWorkflow(db, parseSetupWorkflowUpdate(body));
+          } catch (error) {
+            if (error instanceof Error) throw new HttpError(400, error.message);
+            throw error;
+          }
+          json(res, 200, buildSetupGuide({ ...runtime, fmvEngine }));
+          return;
+        }
         case '/api/inventory/reconcile-sales': {
           if (!salesReconciler) throw new HttpError(501, 'Sales reconciler not attached');
           const body = await readObject(req);

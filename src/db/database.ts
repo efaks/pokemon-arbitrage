@@ -4,6 +4,8 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { SQLInputValue, SQLOutputValue } from 'node:sqlite';
 import { redactSecrets } from '../setup/secrets.ts';
+import { defaultSetupWorkflowState, SETUP_PROFILES, SETUP_STEP_IDS } from '../setup/setupSteps.ts';
+import type { SetupStepId, SetupWorkflowState } from '../setup/setupSteps.ts';
 import type { ArbitrageConfig } from '../config.ts';
 import type {
   ArbitrageDecision,
@@ -180,6 +182,16 @@ const SCHEMA = `
     payload TEXT NOT NULL,
     created_at TEXT NOT NULL
   ) STRICT;
+  CREATE INDEX IF NOT EXISTS audit_events_type_created_at ON audit_events (event_type, created_at);
+
+  CREATE TABLE IF NOT EXISTS setup_workflow (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    target_profile TEXT NOT NULL,
+    profile_selected INTEGER NOT NULL,
+    acknowledged_steps TEXT NOT NULL,
+    skipped_steps TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) STRICT;
 `;
 
 const OPEN_ORDER_STATUSES = "('approved', 'executing')";
@@ -207,6 +219,43 @@ function optional<T extends string | number>(value: SQLOutputValue): T | undefin
 
 function json<T>(value: SQLOutputValue): T {
   return JSON.parse(value as string) as T;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function readJsonRecord(value: SQLOutputValue): Record<string, unknown> {
+  try {
+    return asRecord(json<unknown>(value));
+  } catch (error) {
+    if (error instanceof SyntaxError) return {};
+    throw error;
+  }
+}
+
+function readSetupCheckpoints<K extends 'note' | 'reason'>(value: SQLOutputValue, field: K) {
+  const entries = readJsonRecord(value);
+  const checkpoints: Partial<Record<SetupStepId, Record<K | 'recordedAt', string>>> = {};
+  for (const id of SETUP_STEP_IDS) {
+    const entry = asRecord(entries[id]);
+    const message = entry[field];
+    const { recordedAt } = entry;
+    if (typeof message === 'string' && message.trim() && typeof recordedAt === 'string' && Number.isFinite(Date.parse(recordedAt))) {
+      checkpoints[id] = { [field]: redactSecrets(message), recordedAt } as Record<K | 'recordedAt', string>;
+    }
+  }
+  return checkpoints;
+}
+
+function readSetupWorkflow(row: Row): SetupWorkflowState {
+  const defaults = defaultSetupWorkflowState(row.updated_at as string);
+  const profile = SETUP_PROFILES.find(value => value === row.target_profile);
+  return {
+    ...defaults, targetProfile: profile ?? defaults.targetProfile, profileSelected: profile !== undefined && row.profile_selected === 1,
+    acknowledgedSteps: readSetupCheckpoints(row.acknowledged_steps, 'note'),
+    skippedSteps: readSetupCheckpoints(row.skipped_steps, 'reason'),
+  };
 }
 
 function bindings(fields: Record<string, SQLInputValue | undefined>): Record<string, SQLInputValue> {
@@ -418,6 +467,10 @@ export class ArbitrageDatabase {
         INSERT OR IGNORE INTO system_state
           (id, operating_mode, kill_switch_engaged, consecutive_errors, updated_at)
         VALUES (1, 'shadow', 0, 0, ?)
+      `).run(new Date().toISOString());
+      this.db.prepare(`
+        INSERT OR IGNORE INTO setup_workflow (id, target_profile, profile_selected, acknowledged_steps, skipped_steps, updated_at)
+        VALUES (1, 'live_closed_loop', 0, '{}', '{}', ?)
       `).run(new Date().toISOString());
     } catch (error) {
       this.db.close();
@@ -728,6 +781,34 @@ export class ArbitrageDatabase {
     const row = this.db.prepare('SELECT * FROM system_state WHERE id = 1').get();
     if (!row) throw new Error('System state row is missing');
     return readSystemState(row);
+  }
+
+  getSetupWorkflowState(): SetupWorkflowState {
+    const row = this.db.prepare('SELECT * FROM setup_workflow WHERE id = 1').get();
+    if (!row) throw new Error('Setup workflow row is missing');
+    return readSetupWorkflow(row);
+  }
+
+  saveSetupWorkflowState(state: SetupWorkflowState): SetupWorkflowState {
+    const { targetProfile, profileSelected, acknowledgedSteps, skippedSteps, updatedAt } = state;
+    const row = this.db.prepare(`
+      UPDATE setup_workflow SET target_profile = ?, profile_selected = ?, acknowledged_steps = ?, skipped_steps = ?, updated_at = ?
+      WHERE id = 1 RETURNING *
+    `).get(targetProfile, Number(profileSelected), JSON.stringify(redactSecrets(acknowledgedSteps)),
+      JSON.stringify(redactSecrets(skippedSteps)), updatedAt);
+    if (!row) throw new Error('Setup workflow row is missing');
+    return readSetupWorkflow(row);
+  }
+
+  hasCompletedShadowPass(): boolean {
+    if (this.db.prepare("SELECT 1 FROM orders WHERE status = 'shadow_recorded' LIMIT 1").get()) return true;
+    const recentCycles = this.db.prepare(`
+      SELECT payload FROM audit_events WHERE event_type = 'cycle.completed' ORDER BY created_at DESC, rowid DESC LIMIT 50
+    `).all();
+    return recentCycles.some(row => {
+      const { operatingMode, errorCount, fetchedCount } = readJsonRecord(row.payload);
+      return operatingMode === 'shadow' && errorCount === 0 && typeof fetchedCount === 'number' && fetchedCount > 0;
+    });
   }
 
   /** Updates the singleton and reads back the exact state written by this operation. */

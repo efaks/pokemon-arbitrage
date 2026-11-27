@@ -4,16 +4,26 @@ import { dirname, join, resolve } from 'node:path';
 import { HttpResponseError } from '../connectors/base.ts';
 import type { FetchLike } from '../connectors/base.ts';
 import { EbayOAuthTokenManager, withEbayToken } from '../connectors/ebayAuth.ts';
+import type { ArbitrageDatabase } from '../db/database.ts';
 import { evaluateReadiness } from '../engine/readiness.ts';
 import type { ReadinessReport } from '../engine/readiness.ts';
 import { applyEnvUpdate, encodedEnvMarker, envAssignment, envValueComment, readEnvFile } from '../env.ts';
 import { discoverEbaySellerSetup, sellerSetupTokenProvider } from './ebayOnboarding.ts';
 import { rememberSecret, SECRET_ENV_KEYS, secretMask, redactSecrets } from './secrets.ts';
-import { setupSteps } from './setupSteps.ts';
-import type { SetupStep } from './setupSteps.ts';
+import {
+  defaultSetupWorkflowState, isStepAcknowledgeable, isStepSkippableForProfile, SETUP_PROFILES, SETUP_STEP_IDS, setupSteps,
+} from './setupSteps.ts';
+import type { SetupProfile, SetupStep, SetupStepId, SetupWorkflowDirective, SetupWorkflowState } from './setupSteps.ts';
 
 export { SECRET_ENV_KEYS };
-export type { SetupStep };
+export {
+  defaultSetupWorkflowState, isStepAcknowledgeable, isStepSkippableForProfile,
+  SETUP_PROFILES, SETUP_STEP_IDS, SETUP_PROFILE_DEFINITIONS,
+} from './setupSteps.ts';
+export type {
+  SetupAgentAction, SetupExternalLink, SetupPhase, SetupProfile, SetupProfileDefinition, SetupStep, SetupStepAcknowledgement,
+  SetupStepId, SetupStepSkip, SetupStepStatus, SetupWorkflowDirective, SetupWorkflowState,
+} from './setupSteps.ts';
 
 export const ALLOWED_ENV_KEYS: ReadonlySet<string> = new Set([
   ...SECRET_ENV_KEYS, 'EBAY_CLIENT_ID', 'EBAY_RU_NAME',
@@ -102,17 +112,104 @@ export interface SetupGuideReport {
   envPath: string;
   readiness: ReadinessReport;
   steps: SetupStep[];
+  currentStep: SetupStep | null;
+  workflow: SetupWorkflowDirective;
+  workflowState: SetupWorkflowState;
   setupProgressPct: number;
-  nextSetupStep: string | null;
+  nextSetupStep: SetupStepId | null;
+}
+
+export interface SetupWorkflowUpdateInput {
+  targetProfile?: SetupProfile;
+  acknowledgeStep?: SetupStepId;
+  note?: string;
+  skipStep?: SetupStepId;
+  reason?: string;
+  clearStep?: SetupStepId;
+  reset?: boolean;
+}
+
+export class SetupWorkflowInputError extends Error {}
+
+export function updateSetupWorkflow(db: ArbitrageDatabase, input: SetupWorkflowUpdateInput): SetupWorkflowState {
+  const { targetProfile, acknowledgeStep, note, skipStep, reason, clearStep, reset } = input;
+  const mutations = { targetProfile, acknowledgeStep, note, skipStep, reason, clearStep };
+  if (reset === true && Object.values(mutations).some(value => value !== undefined)) {
+    throw new SetupWorkflowInputError('reset cannot be combined with other workflow fields');
+  }
+  if (reset !== true && [targetProfile, acknowledgeStep, skipStep, clearStep].every(value => value === undefined)) {
+    throw new SetupWorkflowInputError('Provide targetProfile, acknowledgeStep, skipStep, clearStep, or reset: true');
+  }
+  if (targetProfile !== undefined && !SETUP_PROFILES.includes(targetProfile)) {
+    throw new SetupWorkflowInputError('Invalid targetProfile');
+  }
+  for (const [field, id] of Object.entries({ acknowledgeStep, skipStep, clearStep })) {
+    if (id !== undefined && !SETUP_STEP_IDS.includes(id)) throw new SetupWorkflowInputError(`Invalid ${field}`);
+  }
+  const cleanNote = checkpointText(acknowledgeStep, note, 'acknowledgeStep', 'note');
+  const cleanReason = checkpointText(skipStep, reason, 'skipStep', 'reason');
+
+  return db.withWriteTransaction(() => {
+    const nowIso = new Date().toISOString();
+    if (reset === true) {
+      const saved = db.saveSetupWorkflowState(defaultSetupWorkflowState(nowIso));
+      db.logAuditEvent('setup.workflow_updated', { reset: true, targetProfile: saved.targetProfile });
+      return saved;
+    }
+    const state = db.getSetupWorkflowState();
+    const nextProfile = targetProfile ?? state.targetProfile;
+    if (acknowledgeStep && !isStepAcknowledgeable(acknowledgeStep)) {
+      throw new Error(`${acknowledgeStep} requires its prerequisite check and cannot be acknowledged manually`);
+    }
+    if (skipStep && !isStepSkippableForProfile(skipStep, nextProfile)) {
+      const guidance = skipStep === 'ebay_checkout' ? '. Select hitl_alerts for operator-managed checkout' : '';
+      throw new Error(`${skipStep} is required for ${nextProfile}${guidance}`);
+    }
+    const { acknowledgedSteps, skippedSteps } = state;
+    if (targetProfile !== undefined) {
+      for (const id of SETUP_STEP_IDS) {
+        if (!isStepSkippableForProfile(id, nextProfile)) delete skippedSteps[id];
+      }
+    }
+    if (acknowledgeStep && cleanNote) {
+      acknowledgedSteps[acknowledgeStep] = { note: cleanNote, recordedAt: nowIso };
+      delete skippedSteps[acknowledgeStep];
+    }
+    if (skipStep && cleanReason) {
+      skippedSteps[skipStep] = { reason: cleanReason, recordedAt: nowIso };
+      delete acknowledgedSteps[skipStep];
+    }
+    if (clearStep) {
+      delete acknowledgedSteps[clearStep];
+      delete skippedSteps[clearStep];
+    }
+    const saved = db.saveSetupWorkflowState({
+      ...state, targetProfile: nextProfile, profileSelected: state.profileSelected || targetProfile !== undefined, updatedAt: nowIso,
+    });
+    db.logAuditEvent('setup.workflow_updated', redactSecrets({
+      targetProfile: saved.targetProfile, acknowledgeStep, skipStep, clearStep,
+    }));
+    return saved;
+  });
+}
+
+function checkpointText(step: SetupStepId | undefined, value: string | undefined, stepField: string, textField: string) {
+  if (step === undefined && value !== undefined) throw new SetupWorkflowInputError(`${textField} requires ${stepField}`);
+  if (step !== undefined && (typeof value !== 'string' || !value.trim())) {
+    throw new SetupWorkflowInputError(`${stepField} requires a non-blank ${textField}`);
+  }
+  return value === undefined ? undefined : redactSecrets(value.trim());
 }
 
 export function buildSetupGuide(
   runtime: Parameters<typeof evaluateReadiness>[0], options: { envPath?: string } = {},
 ): SetupGuideReport {
-  const readiness = evaluateReadiness(runtime);
+  const workflowState = runtime.db.getSetupWorkflowState();
+  const shadowPassRecorded = runtime.db.hasCompletedShadowPass();
+  const readiness = evaluateReadiness(runtime, { setup: { state: workflowState, shadowPassRecorded } });
   return redactSecrets({
-    envPath: resolve(options.envPath ?? runtime.envPath ?? '.env'), readiness,
-    ...setupSteps(readiness, runtime.db.listOrders('shadow_recorded', 1).length > 0),
+    envPath: resolve(options.envPath ?? runtime.envPath ?? '.env'), readiness, workflowState,
+    ...setupSteps(readiness, shadowPassRecorded, workflowState),
   });
 }
 

@@ -3,6 +3,7 @@ import { fetchWithBackoff, HttpResponseError } from '../connectors/base.ts';
 import type { FetchLike } from '../connectors/base.ts';
 import { EbayOAuthTokenManager, withEbayToken } from '../connectors/ebayAuth.ts';
 import type { EbayTokenProvider } from '../connectors/ebayAuth.ts';
+import { rememberSecret } from './secrets.ts';
 
 const scopeBase = 'https://api.ebay.com/oauth/api_scope';
 const apiRoot = (sandbox?: boolean) => `https://api.${sandbox ? 'sandbox.' : ''}ebay.com`;
@@ -57,6 +58,8 @@ export async function exchangeEbayAuthorizationCode(options: {
   const clientSecret = options.clientSecret.trim();
   const ruName = options.ruName.trim();
   const code = normalizeCode(options.code);
+  rememberSecret(options.code);
+  rememberSecret(code);
   if (!clientId || !clientSecret || !ruName || !code.trim()) {
     throw new Error('eBay code exchange requires client credentials, the RuName, and an authorization code');
   }

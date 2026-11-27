@@ -19,6 +19,7 @@ import type {
 } from '../src/mcp/protocol.ts';
 import { createArbitrageServer } from '../src/server/httpServer.ts';
 import { ALLOWED_ENV_KEYS, SECRET_ENV_KEYS } from '../src/setup/configManager.ts';
+import type { SetupGuideReport } from '../src/setup/configManager.ts';
 
 const request = (id: number | string, method: string, params?: unknown) => ({ jsonrpc: '2.0', id, method, params });
 const notification = { jsonrpc: '2.0', method: 'notifications/initialized' };
@@ -34,7 +35,7 @@ const toolNames = [
   'record_inventory_sale', 'list_audit_events',
   'get_buy_book', 'get_alpha_telemetry', 'ingest_webhook_listing', 'run_autonomous_triage', 'run_repricing_cycle',
   'import_sold_comps', 'sync_market_data', 'check_readiness', 'bootstrap_catalog', 'run_autopilot_pass',
-  'get_setup_guide', 'configure_settings', 'start_ebay_oauth', 'complete_ebay_oauth', 'discover_ebay_policies',
+  'get_setup_guide', 'update_setup_workflow', 'configure_settings', 'start_ebay_oauth', 'complete_ebay_oauth', 'discover_ebay_policies',
   'test_provider_connection', 'reconcile_ebay_sales', 'expand_catalog',
 ];
 const resourceUris = ['state', 'hitl-queue', 'catalog', 'inventory', 'decisions/recent', 'audit/recent', 'buy-book', 'telemetry', 'readiness', 'setup-guide']
@@ -110,14 +111,18 @@ test('MCP negotiates protocol versions and handles lifecycle messages and JSON-R
   assertRpcError(batch[2], codes.METHOD_NOT_FOUND);
 });
 
-test('MCP exposes exactly 36 validated tools, 10 resources, and 6 prompts', async t => {
-  const { send, server } = setup(t);
+test('MCP exposes exactly 37 validated tools, 10 resources, and 6 prompts', async t => {
+  const { send, server, call } = setup(t);
   const { tools } = result<{ tools: McpToolDefinition[] }>(await send('tools/list'));
+  assert.equal(tools.length, 37);
   assert.deepEqual(tools.map(tool => tool.name), toolNames);
   assert.ok(tools.every(tool => tool.inputSchema.type === 'object' && tool.inputSchema.additionalProperties === false &&
     tool.description && typeof tool.annotations.readOnlyHint === 'boolean'));
   assert.equal(tools.find(tool => tool.name === 'evaluate_listing')?.annotations.readOnlyHint, true);
   assert.equal(tools.find(tool => tool.name === 'check_readiness')?.annotations.readOnlyHint, true);
+  assert.deepEqual(tools.find(tool => tool.name === 'update_setup_workflow')?.annotations, {
+    readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false,
+  });
 
   const { resources } = result<{ resources: McpResourceDefinition[] }>(await send('resources/list'));
   assert.deepEqual(resources.map(resource => resource.uri), resourceUris);
@@ -145,6 +150,11 @@ test('MCP exposes exactly 36 validated tools, 10 resources, and 6 prompts', asyn
     toolCall(2, 'run_autopilot_pass', { tier: 'other' }),
     toolCall(2, 'run_autopilot_pass', { syncFirst: 1 }),
     toolCall(2, 'run_autopilot_pass', { syncLimit: 0 }),
+    ...[
+      {}, { targetProfile: 'bad' }, { acknowledgeStep: 'risk_and_tax' }, { note: 'only note' },
+      { reset: true, targetProfile: 'hitl_alerts' }, { clearStep: 'constructor' }, { reset: 'true' },
+      { skipStep: 'alerting_and_verification', reason: 123 }, { targetProfile: 'hitl_alerts', extra: true },
+    ].map(args => toolCall(2, 'update_setup_workflow', args)),
     toolCall(2, 'configure_settings', { settings: { EBAY_CLIENT_ID: {} } }),
     toolCall(2, 'discover_ebay_policies', { createDefaultLocation: { locationKey: 'warehouse' } }),
     toolCall(2, 'test_provider_connection', { provider: 'bad' }),
@@ -154,6 +164,8 @@ test('MCP exposes exactly 36 validated tools, 10 resources, and 6 prompts', asyn
     request(2, 'prompts/get', { name: 'review_hitl_queue', arguments: { focusOrderId: false } }),
   ];
   for (const call of invalidCalls) assertRpcError(await server.handleMessage(call), codes.INVALID_PARAMS);
+  assertToolError(await call('update_setup_workflow', { skipStep: 'catalog', reason: 'Testing' }), /catalog is required/);
+  assertToolError(await call('update_setup_workflow', { acknowledgeStep: 'market_data', note: 'Testing' }), /prerequisite check/);
 });
 
 test('MCP bootstraps the catalog, refreshes readiness, and runs a pass with optional sync', async t => {
@@ -376,7 +388,8 @@ test('MCP reads all resources and renders all prompts from current data', async 
     ['incident_triage', undefined, ['killSwitchEngaged', 'mcp.kill_switch_updated', 'Payment declined']],
     ['autopilot_optimization', undefined, ['buyBook', 'detectToDecision', 'autopilotConfig']],
     ['autonomous_buyer', undefined, ['check_readiness', 'sync_market_data', 'run_autopilot_pass', 'Incident under review']],
-    ['guided_setup_wizard', undefined, ['nextSetupStep', 'complete_ebay_oauth', 'setupProgressPct']],
+    ['guided_setup_wizard', undefined, ['nextSetupStep', 'complete_ebay_oauth', 'setupProgressPct', 'targetProfile',
+      'update_setup_workflow', 'questionsForUser', 'currentStep']],
   ] as const) {
     const { messages } = result<{ messages: McpPromptMessage[] }>(await send('prompts/get', { name, arguments: args }));
     assert.equal(messages.length, 1);
@@ -459,7 +472,7 @@ test('spawned MCP stdio CLI flushes every JSON-RPC response at EOF with clean st
   assert.equal(result<{ contents: McpResourceContent[] }>(responses[11]).contents.length, 1);
   assert.equal(result<{ messages: McpPromptMessage[] }>(responses[12]).messages.length, 1);
   assert.equal(result<McpInitializeResult>(responses[1]).protocolVersion, '2025-03-26');
-  assert.equal(result<{ tools: McpToolDefinition[] }>(responses[2]).tools.length, 36);
+  assert.equal(result<{ tools: McpToolDefinition[] }>(responses[2]).tools.length, 37);
   const scan = result<McpToolCallResult>(responses[3]);
   assert.equal(scan.isError, undefined);
   assert.equal((scan.structuredContent?.summary as { fetchedCount: number }).fetchedCount, 17);
@@ -642,7 +655,15 @@ test('MCP completes guided setup, applies settings to existing handlers, and red
   assert.equal(reconciled.enabled, true);
   assert.equal(reconciled.cashBalanceCents, 120000);
 
-  const canary = [...Object.values(secrets), issuedAccess, issuedRefresh].join(' ');
+  const canary = [...Object.values(secrets), issuedAccess, issuedRefresh, 'encoded+code'].join(' ');
+  const checkpoint = await tool('update_setup_workflow', {
+    targetProfile: 'hitl_alerts', acknowledgeStep: 'risk_and_tax', note: 'Confirmed plan ' + canary,
+    skipStep: 'alerting_and_verification', reason: 'Using manual checks ' + canary,
+  });
+  const { workflowState } = checkpoint as unknown as SetupGuideReport;
+  assert.match(workflowState.acknowledgedSteps.risk_and_tax!.note, /Confirmed plan \[redacted\]/);
+  assert.match(workflowState.skippedSteps.alerting_and_verification!.reason, /Using manual checks \[redacted\]/);
+  assert.deepEqual(db.getSetupWorkflowState(), workflowState);
   await tool('set_kill_switch', { engaged: true, reason: canary });
   await send('resources/read', { uri: 'pokemon-arbitrage://setup-guide' });
   await send('prompts/get', { name: 'guided_setup_wizard' });
@@ -651,6 +672,7 @@ test('MCP completes guided setup, applies settings to existing handlers, and red
   const configurationAudit = audits.find(event => event.eventType === 'mcp.settings_configured');
   assert.ok(configurationAudit);
   assert.deepEqual(Object.keys(configurationAudit.payload).sort(), ['removedKeys', 'updatedKeys']);
+  assert.ok(audits.some(event => event.eventType === 'setup.workflow_updated'));
   for (const secret of canary.split(' ')) {
     assert.ok(!JSON.stringify(responses).includes(secret), 'MCP must redact all current and rotated credentials');
     assert.ok(!JSON.stringify(audits).includes(secret), 'Audit persistence must redact credentials');

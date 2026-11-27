@@ -1,5 +1,6 @@
 import type { SystemRuntime } from '../cli.ts';
-import { setupSteps } from '../setup/setupSteps.ts';
+import { SETUP_PROFILE_DEFINITIONS, setupSteps } from '../setup/setupSteps.ts';
+import type { SetupProfile, SetupWorkflowState } from '../setup/setupSteps.ts';
 import type { OperatingMode } from '../domain/types.ts';
 import type { AutopilotEngine } from './autopilot.ts';
 import { EbaySellInventoryAdapter, SimulatedSellerAdapter } from '../liquidation/ebaySellerAdapter.ts';
@@ -11,6 +12,7 @@ export interface ReadinessReport {
   nodeVersion: string;
   dbPath: string;
   operatingMode: OperatingMode;
+  targetProfile: SetupProfile;
   killSwitchEngaged: boolean;
   killSwitchReason?: string;
   envFileLoaded: boolean;
@@ -51,13 +53,21 @@ function splitByEnabled(sources: readonly { name: string; isEnabled(): boolean }
 
 export function evaluateReadiness(
   runtime: ReadinessRuntime,
-  options: { autopilot?: AutopilotEngine; useMock?: boolean; envFileLoaded?: boolean; nowIso?: string } = {},
+  options: {
+    autopilot?: AutopilotEngine;
+    useMock?: boolean;
+    envFileLoaded?: boolean;
+    nowIso?: string;
+    setup?: { state: SetupWorkflowState; shadowPassRecorded: boolean };
+  } = {},
 ): ReadinessReport {
   const { db, config, fmvEngine } = runtime;
   const useMock = options.useMock ?? runtime.useMock ?? false;
   const envFileLoaded = options.envFileLoaded ?? runtime.envFileLoaded ?? false;
   const nowIso = options.nowIso ?? new Date().toISOString();
   const { operatingMode, killSwitchEngaged, killSwitchReason } = db.getSystemState();
+  const workflowState = options.setup?.state ?? db.getSetupWorkflowState();
+  const { targetProfile } = workflowState;
   const skus = db.listSkus();
   const catalogSkuCount = skus.length;
   const freshCompSkuCount = skus.filter(sku =>
@@ -117,8 +127,12 @@ export function evaluateReadiness(
   }
   if (operatingMode === 'shadow') warnings.push('Shadow mode records paper trades and prevents live checkout.');
   if (checkoutCapability === 'manual_only') {
-    blockingIssues.push('Live auto-buy requires eBay member Order API credentials.');
-    recommendedNextActions.push('Configure approved eBay OAuth member credentials or an EBAY_ORDER_API_TOKEN for checkout.');
+    if (targetProfile === 'hitl_alerts') {
+      warnings.push('Live auto-buy is unavailable without eBay member Order API credentials (HITL alert profile active).');
+    } else {
+      blockingIssues.push('Live auto-buy requires eBay member Order API credentials.');
+      recommendedNextActions.push('Configure approved eBay OAuth member credentials or an EBAY_ORDER_API_TOKEN for checkout.');
+    }
   } else if (checkoutCapability === 'ebay_static_token') {
     warnings.push('The static eBay Order token expires and must be rotated by the operator.');
   } else if (useMock) {
@@ -131,18 +145,20 @@ export function evaluateReadiness(
   if (certVerifier === 'psa_unconfigured') warnings.push('PSA_API_TOKEN is missing. Graded listings may require certificate review.');
   if (!useMock && visionVerifier === 'heuristic') warnings.push('Photo assessment uses heuristics. Set VISION_API_URL and VISION_API_KEY for live vision.');
   if (!useMock && !webhookAlertingEnabled) warnings.push('External webhook alerts are disabled. Set ARBITRAGE_WEBHOOK_URL to enable them.');
-  if (readyForShadowScan && operatingMode !== 'live') {
-    recommendedNextActions.push('Review a shadow pass and confirm operator approval before switching to live.');
+  const { targetMode } = SETUP_PROFILE_DEFINITIONS[targetProfile];
+  if (readyForShadowScan && (operatingMode === 'shadow' || (targetMode === 'live' && operatingMode === 'hitl'))) {
+    recommendedNextActions.push(`Review a shadow pass and confirm operator approval before switching to ${targetMode}.`);
   }
 
   const report: Omit<ReadinessReport, 'setupProgressPct' | 'nextSetupStep'> = {
     fulfillmentSyncEnabled: runtime.salesReconciler?.isConfigured() ?? false,
     dynamicCashBalanceCents: db.getPortfolioSnapshot(config, nowIso).cashBalanceCents,
-    nodeVersion: process.version, dbPath: config.dbPath, operatingMode, killSwitchEngaged, killSwitchReason,
+    nodeVersion: process.version, dbPath: config.dbPath, operatingMode, targetProfile, killSwitchEngaged, killSwitchReason,
     envFileLoaded, catalogSkuCount, freshCompSkuCount, staleCompSkuCount, enabledConnectors, disabledConnectors,
     enabledSyncers, disabledSyncers, checkoutCapability, sellCapability, certVerifier, visionVerifier, webhookAlertingEnabled,
     readyForShadowScan, readyForHitlAlerts, readyForLiveAutoBuy, readyForLiveAutoSell, blockingIssues, warnings, recommendedNextActions,
   };
-  const { setupProgressPct, nextSetupStep } = setupSteps(report, db.listOrders('shadow_recorded', 1).length > 0);
+  const shadowPassRecorded = options.setup?.shadowPassRecorded ?? db.hasCompletedShadowPass();
+  const { setupProgressPct, nextSetupStep } = setupSteps(report, shadowPassRecorded, workflowState);
   return { ...report, setupProgressPct, nextSetupStep };
 }
